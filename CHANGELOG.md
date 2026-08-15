@@ -2,6 +2,10 @@
 
 本專案由可攜式粵語候選字輔助工具逐步演進。v0.5 是首個可重現建置並正式公開發佈的安全修正版；v0.1 至 v0.4 的原始中間二進位檔沒有保留，因此以下紀錄描述功能演進，而不把事後重建的檔案誤標為歷史原始產物。
 
+## v0.8.4 Online — Sophos／HitmanPro.Alert 安全相容模式
+
+根據實機 Windows Application Error Event ID 1000：`hmpalert.dll` 的存取違規，新增端點防護安全相容模式。啟動時若偵測到 `hmpalert.dll` 已載入，程式不安裝 `WH_KEYBOARD_LL` 全域鍵盤掛鈎、不攔截背景按鍵、不使用 `SendInput` 自動貼字，並自動開啟前景「安全相容輸入」面板。使用者可輸入粵拼、搜尋 Google 候選、複製選取結果，再手動於目標程式按 `Ctrl + V`。此模式已在受 Sophos／HitmanPro.Alert 管理的 Windows 11 裝置完成穩定性實機驗證。未偵測到該模組的電腦，則維持背景候選與 NumPad 操作。
+
 ## v0.8.1 Online — NumPad 候選選取
 
 保留 Google 粵語線上候選、離線候選快取、本機近音與語境排序，並新增 NumPad `1`–`9` 選取目前頁面候選。NumPad Enter 繼續映射至一般 Enter，確認目前焦點；候選不存在時不攔截 NumPad 數字。

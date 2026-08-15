@@ -1,4 +1,4 @@
-# 粵語候選字工具（Windows 11 可攜版 v0.8.1 Online）
+# 粵語候選字工具（Windows 11 可攜版 v0.8.4 Online）
 
 這是一個 **免安裝、單一執行檔** 的 Windows x64 粵語輸入輔助工具。它在使用者主動開啟中文模式後，將近似英文拼音送往 Google Input Tools 的粵語候選字服務，顯示多頁候選字，並把選取結果貼入目前的程式。它並非 Google 官方產品，亦不是 Windows 語言列內的原生 IME。
 
@@ -67,6 +67,16 @@ m4goi	唔該
 工具採用與可攜式九方工具相近的「背景按鍵處理＋候選視窗」模式，而不是把自己安裝成 Windows TSF/IME。因此它可解壓直接使用，並在多數一般桌面 App 中貼字；不過 Windows 的安全隔離仍然生效。如果目標程式以「系統管理員身分執行」，本工具也須以相同權限啟動才能貼字。部分密碼欄、遊戲、防作弊程式和受保護輸入框會封鎖貼上，工具不會嘗試繞過這些保護。
 
 新拼音需要網絡才可取得 Google 候選字；但服務無回應時，程式會嘗試使用同資料夾 `candidate_cache.tsv` 的離線候選快取。容錯是 Google 候選服務的配對結果，並非保證任意錯拼都能找回原來字詞；錯得太遠時，最合理的另一個讀音可能會排到前面，因此請留意候選列而不要盲目按第一個。
+
+## v0.8.4 Online：Sophos／HitmanPro.Alert 安全相容模式
+
+v0.8.4 是因應實機 Event ID 1000 顯示 `hmpalert.dll` 存取違規而加入的相容性版本。程式啟動時若偵測到 Sophos／HitmanPro.Alert 已注入目前程序，會**不安裝** `WH_KEYBOARD_LL` 全域鍵盤掛鈎，也不會使用背景攔截按鍵或自動貼上；這是刻意的安全降級，不是要求你停用端點防護。
+
+相容模式會自動開啟 **「CantoCandidate Online — 安全相容輸入」** 前景面板。輸入粵拼後按 **「搜尋」**，在結果清單選擇候選並按 **「複製選取候選」**（或雙擊候選）。之後自行回到目標程式按 `Ctrl + V` 貼上。此模式保留 Google 粵語候選、本機快取與選字歷史，但沒有全域按鍵攔截、NumPad 選字、Shift 切換或自動貼上。
+
+右擊系統匣圖示或左擊圖示都可重新開啟安全相容輸入面板；修復中心的「立即修復」在相容模式只會保留面板，**不會**重新安裝全域鍵盤掛鈎。若沒有偵測到該端點防護模組，則維持 v0.8.3 的背景候選、修復中心及單一執行個體模式。
+
+Sophos 官方文件將 `hmpalert.dll` 列為可涉及第三方程式崩潰的端點元件，並建議由管理端收集 dump、SDU 與重現資料；由於此電腦受機構網域管理，請把 Event ID 1000 交給機構 IT／安全團隊處理產品更新或正式供應商升級。[2]
 
 ## v0.8.1 Online：NumPad 選字
 
@@ -148,3 +158,5 @@ x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -mwindows -municode -static -static-lib
 ## 參考資料
 
 [1] [Google Input Tools：Chrome 擴充功能與使用方式](https://www.google.com/inputtools/chrome/)
+
+[2] [Sophos Windows Endpoint：HitmanPro.Alert 應用程式崩潰與效能問題的最低升級要求](https://support.sophos.com/support/s/article/KBA-000006827)

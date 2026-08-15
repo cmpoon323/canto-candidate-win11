@@ -13,15 +13,38 @@
 #include <sstream>
 #include <algorithm>
 #include <cwctype>
+#include <atomic>
+#include <new>
+#include <cstring>
+#include <mutex>
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
 
 constexpr UINT WM_CANDIDATES_READY = WM_APP + 1;
 constexpr UINT WM_TRAY = WM_APP + 2;
+constexpr UINT WM_CANDIDATE_REFRESH = WM_APP + 3;
+constexpr UINT WM_REQUEST_CANDIDATES = WM_APP + 4;
+constexpr UINT WM_SELECT_CANDIDATE = WM_APP + 5;
+constexpr UINT WM_EXPAND_SNIPPET = WM_APP + 6;
+constexpr UINT WM_PASTE_TEXT = WM_APP + 7;
+constexpr UINT WM_TRAY_REFRESH = WM_APP + 8;
+constexpr UINT WM_OPEN_REPAIR_PANEL = WM_APP + 9;
 constexpr UINT TIMER_STATUS = 42;
 constexpr UINT TIMER_REQUEST = 43;
 constexpr UINT TIMER_CLIPBOARD_RESTORE = 44;
+constexpr UINT TIMER_REPAIR_PANEL = 45;
+constexpr int ID_REPAIR_STATUS = 2101;
+constexpr int ID_REPAIR_FIX = 2102;
+constexpr int ID_REPAIR_LOG = 2103;
+constexpr int ID_REPAIR_CLOSE = 2104;
+constexpr UINT WM_OPEN_SAFE_PAD = WM_APP + 10;
+constexpr int ID_SAFE_INPUT = 2201;
+constexpr int ID_SAFE_SEARCH = 2202;
+constexpr int ID_SAFE_RESULTS = 2203;
+constexpr int ID_SAFE_COPY = 2204;
+constexpr int ID_SAFE_CLEAR = 2205;
+constexpr int ID_SAFE_CLOSE = 2206;
 constexpr size_t MAX_COMPOSITION_CHARS = 64;
 constexpr size_t MAX_RESPONSE_BYTES = 1024 * 1024;
 constexpr int HOTKEY_ID = 100;
@@ -45,6 +68,26 @@ std::wstring gComposition;
 std::vector<std::wstring> gCandidates;
 std::wstring gStatus;
 std::wstring gFuzzyHint;
+std::wstring gQueuedCandidateRequest;
+bool gCandidateWorkerActive = false;
+volatile LONG gRefreshQueued = 0;
+volatile LONG gRequestQueued = 0;
+std::atomic<bool> gShuttingDown{false};
+UINT gTaskbarCreatedMessage = 0;
+HWND gRepairWindow = nullptr;
+HWND gRepairStatusControl = nullptr;
+HANDLE gSingleInstanceMutex = nullptr;
+std::mutex gLocalDataMutex;
+ULONGLONG gLastHookTick = 0;
+ULONGLONG gLastCandidateStartTick = 0;
+ULONGLONG gLastCandidateDoneTick = 0;
+ULONGLONG gLastCandidateDurationMs = 0;
+std::wstring gLastWorkerDetail = L"尚未執行候選請求";
+bool gHmpaCompatibilityMode = false;
+HWND gSafePadWindow = nullptr;
+HWND gSafeInputControl = nullptr;
+HWND gSafeResultsControl = nullptr;
+HWND gSafeStatusControl = nullptr;
 
 struct Settings {
     bool followCaret = true;
@@ -65,12 +108,20 @@ std::wstring gLastCommittedWord;
 void ResizeAndShowCandidate();
 void UpdateTrayIcon();
 bool IsSnippetComposition();
+void ShowSafePad();
+void UpdateRepairPanel();
 
 struct CandidateResult {
     std::wstring composition;
+    std::wstring previousWord;
     std::vector<std::wstring> candidates;
     std::wstring fuzzyHint;
     std::wstring error;
+};
+
+struct CandidateRequest {
+    std::wstring composition;
+    std::wstring previousWord;
 };
 
 std::wstring Utf8ToWide(const std::string& input) {
@@ -125,6 +176,38 @@ std::wstring SystemNotepadPath() {
     UINT length = GetWindowsDirectoryW(windowsDirectory, MAX_PATH);
     if (length == 0 || length >= MAX_PATH) return L"notepad.exe";
     return std::wstring(windowsDirectory) + L"\\System32\\notepad.exe";
+}
+
+std::wstring DiagnosticsPath() {
+    return DataFilePath(L"diagnostics.log");
+}
+
+void AppendDiagnosticLog(const std::wstring& event) {
+    try {
+        const std::wstring path = DiagnosticsPath();
+        if (!IsSafeDataPath(path)) return;
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        const std::wstring line =
+            std::to_wstring(now.wYear) + L"-" + std::to_wstring(now.wMonth) + L"-" + std::to_wstring(now.wDay) +
+            L" " + std::to_wstring(now.wHour) + L":" + std::to_wstring(now.wMinute) + L":" + std::to_wstring(now.wSecond) +
+            L" | " + event + L"\r\n";
+        HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return;
+        std::string utf8 = WideToUtf8(line);
+        DWORD written = 0;
+        WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+        CloseHandle(file);
+    } catch (...) {
+        // Diagnostics must never destabilize input handling.
+    }
+}
+
+LONG WINAPI CantoUnhandledExceptionFilter(EXCEPTION_POINTERS* details) {
+    DWORD code = details && details->ExceptionRecord ? details->ExceptionRecord->ExceptionCode : 0;
+    AppendDiagnosticLog(L"FATAL unhandled exception code=" + std::to_wstring(code));
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
 std::string ReadUtf8File(const std::wstring& path) {
@@ -302,6 +385,7 @@ int ContextScore(const std::vector<ContextEntry>& entries, const std::wstring& p
 }
 
 void RecordContext(const std::wstring& previous, const std::wstring& next) {
+    std::lock_guard<std::mutex> lock(gLocalDataMutex);
     if (!gSettings.contextRanking || previous.empty() || next.empty()) return;
     std::vector<ContextEntry> entries = LoadContextHistory();
     for (auto& entry : entries) {
@@ -316,12 +400,14 @@ void RecordContext(const std::wstring& previous, const std::wstring& next) {
 }
 
 void ClearContextHistory() {
+    std::lock_guard<std::mutex> lock(gLocalDataMutex);
     std::wstring path = DataFilePath(L"context_history.tsv");
     if (IsSafeDataPath(path)) DeleteFileW(path.c_str());
     gLastCommittedWord.clear();
 }
 
-std::vector<std::wstring> PersonalizeCandidates(const std::wstring& composition, const std::vector<std::wstring>& remote) {
+std::vector<std::wstring> PersonalizeCandidates(const std::wstring& composition, const std::vector<std::wstring>& remote, const std::wstring& previousWord) {
+    std::lock_guard<std::mutex> lock(gLocalDataMutex);
     std::vector<std::wstring> result = LoadCustomWords(composition);
     std::vector<HistoryEntry> history = LoadHistory();
     std::vector<ContextEntry> context = gSettings.contextRanking ? LoadContextHistory() : std::vector<ContextEntry>{};
@@ -329,7 +415,7 @@ std::vector<std::wstring> PersonalizeCandidates(const std::wstring& composition,
     std::vector<RankedCandidate> ranked;
     for (const auto& word : remote) {
         if (std::find(result.begin(), result.end(), word) == result.end()) {
-            ranked.push_back({word, HistoryScore(history, composition, word), ContextScore(context, gLastCommittedWord, word)});
+            ranked.push_back({word, HistoryScore(history, composition, word), ContextScore(context, previousWord, word)});
         }
     }
     std::stable_sort(ranked.begin(), ranked.end(), [](const RankedCandidate& a, const RankedCandidate& b) {
@@ -341,6 +427,7 @@ std::vector<std::wstring> PersonalizeCandidates(const std::wstring& composition,
 }
 
 void RecordHistory(const std::wstring& composition, const std::wstring& word) {
+    std::lock_guard<std::mutex> lock(gLocalDataMutex);
     if (composition.empty() || word.empty()) return;
     std::vector<HistoryEntry> history = LoadHistory();
     std::wstring key = CompactLower(composition);
@@ -357,6 +444,7 @@ void EnsureDictionaryFile() {
 }
 
 void ClearHistoryFile() {
+    std::lock_guard<std::mutex> lock(gLocalDataMutex);
     std::wstring path = DataFilePath(L"history.tsv");
     if (IsSafeDataPath(path)) DeleteFileW(path.c_str());
 }
@@ -423,6 +511,7 @@ void SaveCandidateCache(const std::vector<CandidateCacheEntry>& entries) {
 }
 
 void StoreCandidateCache(const std::wstring& composition, const std::vector<std::wstring>& candidates) {
+    std::lock_guard<std::mutex> lock(gLocalDataMutex);
     if (composition.empty() || candidates.empty()) return;
     std::vector<CandidateCacheEntry> entries = LoadCandidateCache();
     std::wstring key = CompactLower(composition);
@@ -432,6 +521,7 @@ void StoreCandidateCache(const std::wstring& composition, const std::vector<std:
 }
 
 std::vector<std::wstring> FindCachedCandidates(const std::wstring& composition) {
+    std::lock_guard<std::mutex> lock(gLocalDataMutex);
     std::wstring key = CompactLower(composition);
     std::vector<CandidateCacheEntry> entries = LoadCandidateCache();
     for (auto it = entries.rbegin(); it != entries.rend(); ++it) if (it->input == key) return it->candidates;
@@ -469,6 +559,7 @@ std::vector<std::wstring> LocalFuzzyVariants(const std::wstring& composition) {
 }
 
 FuzzyCacheMatch FindFuzzyCachedCandidates(const std::wstring& composition) {
+    std::lock_guard<std::mutex> lock(gLocalDataMutex);
     FuzzyCacheMatch match;
     if (!gSettings.localFuzzySuggestions) return match;
     std::vector<std::wstring> variants = LocalFuzzyVariants(composition);
@@ -486,6 +577,7 @@ FuzzyCacheMatch FindFuzzyCachedCandidates(const std::wstring& composition) {
 }
 
 void ClearCandidateCache() {
+    std::lock_guard<std::mutex> lock(gLocalDataMutex);
     std::wstring path = DataFilePath(L"candidate_cache.tsv");
     if (IsSafeDataPath(path)) DeleteFileW(path.c_str());
 }
@@ -580,9 +672,9 @@ bool DownloadCandidates(const std::wstring& composition, CandidateResult& result
     std::string targetUtf8 = "/request?text=" + UrlEncodeAscii(composition) +
         "&itc=yue-hant-t-i0-und&num=45&cp=0&cs=1&ie=utf-8&oe=utf-8";
     std::wstring target = Utf8ToWide(targetUtf8);
-    HINTERNET session = WinHttpOpen(L"CantoCandidate/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET session = WinHttpOpen(L"CantoCandidate/0.8.4", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) { result.error = L"無法建立網絡連線"; return false; }
-    WinHttpSetTimeouts(session, 3000, 3000, 4000, 4000);
+    WinHttpSetTimeouts(session, 1200, 1200, 1800, 1800);
     HINTERNET connection = WinHttpConnect(session, L"inputtools.google.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!connection) { WinHttpCloseHandle(session); result.error = L"無法連接候選字服務"; return false; }
     HINTERNET request = WinHttpOpenRequest(connection, L"GET", target.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
@@ -617,13 +709,12 @@ bool DownloadCandidates(const std::wstring& composition, CandidateResult& result
         result.error = L"找不到候選字";
         return false;
     }
-    StoreCandidateCache(composition, remoteCandidates);
-    result.candidates = PersonalizeCandidates(composition, remoteCandidates);
+    result.candidates = remoteCandidates;
     std::wstring firstAnnotation = ParseFirstAnnotation(body);
     if (!firstAnnotation.empty() && CompactLower(firstAnnotation) != CompactLower(composition)) {
         result.fuzzyHint = firstAnnotation;
     }
-        if (result.candidates.empty()) {
+    if (result.candidates.empty()) {
         result.error = L"找不到候選字";
         return false;
     }
@@ -631,30 +722,68 @@ bool DownloadCandidates(const std::wstring& composition, CandidateResult& result
 }
 
 DWORD WINAPI CandidateThread(LPVOID parameter) {
-    std::wstring* input = static_cast<std::wstring*>(parameter);
-    CandidateResult* result = new CandidateResult();
-    result->composition = *input;
-    delete input;
-    if (!DownloadCandidates(result->composition, *result)) {
-        std::vector<std::wstring> cached = FindCachedCandidates(result->composition);
-        if (!cached.empty()) {
-            result->candidates = PersonalizeCandidates(result->composition, cached);
-            result->error = L"離線候選快取";
+    CandidateRequest* request = static_cast<CandidateRequest*>(parameter);
+    CandidateResult* result = new (std::nothrow) CandidateResult();
+    if (!result) { delete request; AppendDiagnosticLog(L"candidate worker allocation failed"); return 0; }
+    result->composition = request->composition;
+    result->previousWord = request->previousWord;
+    delete request;
+    if (gShuttingDown.load()) { delete result; return 0; }
+    try {
+        if (DownloadCandidates(result->composition, *result)) {
+            StoreCandidateCache(result->composition, result->candidates);
+            result->candidates = PersonalizeCandidates(result->composition, result->candidates, result->previousWord);
+            result->error = L"ONLINE";
         } else {
-            FuzzyCacheMatch fuzzy = FindFuzzyCachedCandidates(result->composition);
-            if (!fuzzy.candidates.empty()) {
-                result->candidates = PersonalizeCandidates(result->composition, fuzzy.candidates);
-                result->error = L"離線本機近音建議";
-                result->fuzzyHint = L"本機近音：" + fuzzy.matchedInput;
+            std::vector<std::wstring> cached = FindCachedCandidates(result->composition);
+            if (!cached.empty()) {
+                result->candidates = PersonalizeCandidates(result->composition, cached, result->previousWord);
+                result->error = L"離線候選快取";
+            } else {
+                FuzzyCacheMatch fuzzy = FindFuzzyCachedCandidates(result->composition);
+                if (!fuzzy.candidates.empty()) {
+                    result->candidates = PersonalizeCandidates(result->composition, fuzzy.candidates, result->previousWord);
+                    result->error = L"離線本機近音建議";
+                    result->fuzzyHint = L"本機近音：" + fuzzy.matchedInput;
+                }
             }
         }
+    } catch (...) {
+        result->candidates.clear();
+        result->error = L"候選處理發生錯誤；可使用修復中心重新初始化";
+        AppendDiagnosticLog(L"candidate worker caught an exception");
     }
-    if (!PostMessage(gMain, WM_CANDIDATES_READY, 0, reinterpret_cast<LPARAM>(result))) delete result;
+    if (!gShuttingDown.load() && IsWindow(gMain) && PostMessage(gMain, WM_CANDIDATES_READY, 0, reinterpret_cast<LPARAM>(result))) return 0;
+    delete result;
     return 0;
 }
 
-void RequestCandidates() {
-    if (gComposition.empty()) return;
+void QueueCandidateRefresh() {
+    if (gMain && InterlockedExchange(&gRefreshQueued, 1) == 0) {
+        if (!PostMessageW(gMain, WM_CANDIDATE_REFRESH, 0, 0)) InterlockedExchange(&gRefreshQueued, 0);
+    }
+}
+
+void StartCandidateWorker(const std::wstring& composition) {
+    CandidateRequest* request = new (std::nothrow) CandidateRequest{composition, gLastCommittedWord};
+    if (!request) { AppendDiagnosticLog(L"candidate request allocation failed"); return; }
+    HANDLE thread = CreateThread(nullptr, 0, CandidateThread, request, 0, nullptr);
+    if (thread) {
+        gCandidateWorkerActive = true;
+        gLastCandidateStartTick = GetTickCount64();
+        gLastWorkerDetail = L"正在查詢 Google 粵語候選";
+        CloseHandle(thread);
+    } else {
+        delete request;
+        gLastWorkerDetail = L"無法建立候選工作";
+        AppendDiagnosticLog(L"candidate worker creation failed error=" + std::to_wstring(GetLastError()));
+    }
+}
+
+void ProcessCandidateRequest() {
+    InterlockedExchange(&gRequestQueued, 0);
+    if (gShuttingDown.load() || gComposition.empty()) return;
+    if (gCandidateWorkerActive) { gQueuedCandidateRequest = gComposition; return; }
     constexpr ULONGLONG debounceMs = 120;
     ULONGLONG now = GetTickCount64();
     if (now - gLastRequestTick < debounceMs) {
@@ -664,9 +793,20 @@ void RequestCandidates() {
     }
     gPendingComposition.clear();
     gLastRequestTick = now;
-    std::wstring* request = new std::wstring(gComposition);
-    HANDLE thread = CreateThread(nullptr, 0, CandidateThread, request, 0, nullptr);
-    if (thread) CloseHandle(thread); else delete request;
+    StartCandidateWorker(gComposition);
+}
+
+void RequestCandidates() {
+    if (gComposition.empty() || !gMain || gShuttingDown.load()) return;
+    if (InterlockedExchange(&gRequestQueued, 1) == 0) {
+        if (!PostMessageW(gMain, WM_REQUEST_CANDIDATES, 0, 0)) InterlockedExchange(&gRequestQueued, 0);
+    }
+}
+
+void QueuePasteText(const std::wstring& text) {
+    std::wstring* payload = new (std::nothrow) std::wstring(text);
+    if (!payload) { AppendDiagnosticLog(L"paste payload allocation failed"); return; }
+    if (!PostMessageW(gMain, WM_PASTE_TEXT, 0, reinterpret_cast<LPARAM>(payload))) delete payload;
 }
 
 size_t PageCount() {
@@ -743,10 +883,11 @@ void ClearComposition() {
     gStatus.clear();
     gFuzzyHint.clear();
     gPendingComposition.clear();
+    gQueuedCandidateRequest.clear();
     KillTimer(gMain, TIMER_REQUEST);
     gCandidatePage = 0;
     gCandidateFocus = 0;
-    ShowWindow(gCandidateWindow, SW_HIDE);
+    QueueCandidateRefresh();
 }
 
 void ReleaseClipboardBackup() {
@@ -795,6 +936,22 @@ void PasteText(const std::wstring& text) {
         gClipboardSequenceAfterPaste = GetClipboardSequenceNumber();
         SetTimer(gMain, TIMER_CLIPBOARD_RESTORE, 150, nullptr);
     }
+}
+
+bool CopyTextToClipboard(const std::wstring& text) {
+    if (text.empty() || !OpenClipboard(gSafePadWindow)) return false;
+    EmptyClipboard();
+    SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!memory) { CloseClipboard(); return false; }
+    void* destination = GlobalLock(memory);
+    if (!destination) { GlobalFree(memory); CloseClipboard(); return false; }
+    memcpy(destination, text.c_str(), bytes);
+    GlobalUnlock(memory);
+    bool ok = SetClipboardData(CF_UNICODETEXT, memory) != nullptr;
+    if (!ok) GlobalFree(memory);
+    CloseClipboard();
+    return ok;
 }
 
 bool IsSnippetComposition() {
@@ -877,7 +1034,7 @@ void MoveCandidatePage(int direction) {
     if (direction < 0 && gCandidatePage > 0) --gCandidatePage;
     if (direction > 0 && gCandidatePage + 1 < pages) ++gCandidatePage;
     gCandidateFocus = 0;
-    ResizeAndShowCandidate();
+    QueueCandidateRefresh();
 }
 
 void MoveCandidateFocus(int direction) {
@@ -885,7 +1042,7 @@ void MoveCandidateFocus(int direction) {
     if (count == 0) return;
     if (direction < 0 && gCandidateFocus > 0) --gCandidateFocus;
     if (direction > 0 && gCandidateFocus + 1 < count) ++gCandidateFocus;
-    ResizeAndShowCandidate();
+    QueueCandidateRefresh();
 }
 
 void ToggleLanguageMode() {
@@ -920,11 +1077,18 @@ std::wstring ChinesePunctuation(DWORD vk, bool shift) {
 LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code < 0) return CallNextHookEx(gHook, code, wParam, lParam);
     const KBDLLHOOKSTRUCT* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+    gLastHookTick = GetTickCount64();
     DWORD vk = key->vkCode;
     bool keyUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
     if (keyUp) {
         if (gEnabled && gSettings.singleShiftToggle && vk == VK_SHIFT) {
-            if (gShiftDown && !gShiftUsed) ToggleLanguageMode();
+            if (gShiftDown && !gShiftUsed) {
+                gEnglishMode = !gEnglishMode;
+                ClearComposition();
+                gStatus = gEnglishMode ? L"EN　英文直接輸入" : L"中　粵語拼音輸入";
+                QueueCandidateRefresh();
+                PostMessageW(gMain, WM_TRAY_REFRESH, 0, 0);
+            }
             gShiftDown = false;
         }
         return CallNextHookEx(gHook, code, wParam, lParam);
@@ -954,19 +1118,19 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         gComposition.push_back(gSettings.snippetPrefix);
         gCandidates.clear();
         gStatus.clear();
-        ResizeAndShowCandidate();
+        QueueCandidateRefresh();
         return 1;
     }
     std::wstring punctuation = ChinesePunctuation(vk, shift);
     if (!punctuation.empty()) {
         if (!gComposition.empty()) ClearComposition();
-        PasteText(punctuation);
+        QueuePasteText(punctuation);
         return 1;
     }
     if (vk >= 'A' && vk <= 'Z') {
         if (gComposition.size() >= MAX_COMPOSITION_CHARS) {
             gStatus = L"拼音過長，請先確認或按 Esc 取消";
-            ResizeAndShowCandidate();
+            QueueCandidateRefresh();
             return 1;
         }
         gComposition.push_back(static_cast<wchar_t>(towlower(static_cast<wchar_t>(vk))));
@@ -975,7 +1139,7 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         gFuzzyHint.clear();
         gCandidatePage = 0;
         gCandidateFocus = 0;
-        ResizeAndShowCandidate();
+        QueueCandidateRefresh();
         if (!IsSnippetComposition()) RequestCandidates();
         return 1;
     }
@@ -987,7 +1151,7 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         gFuzzyHint.clear();
         gCandidatePage = 0;
         gCandidateFocus = 0;
-        if (gComposition.empty()) ClearComposition(); else { ResizeAndShowCandidate(); RequestCandidates(); }
+        if (gComposition.empty()) ClearComposition(); else { QueueCandidateRefresh(); RequestCandidates(); }
         return 1;
     }
     if (vk == VK_ESCAPE) {
@@ -996,14 +1160,10 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     }
     if (vk == VK_SPACE || vk == VK_RETURN) {
         if (IsSnippetComposition()) {
-            if (!ExpandSnippetComposition()) {
-                gStatus = L"找不到短語；可右擊系統匣開啟 snippets.tsv";
-                ResizeAndShowCandidate();
-                SetTimer(gMain, TIMER_STATUS, 1800, nullptr);
-            }
+            PostMessageW(gMain, WM_EXPAND_SNIPPET, 0, 0);
             return 1;
         }
-        if (!gCandidates.empty()) { SelectCandidate(CurrentPageStart() + gCandidateFocus); return 1; }
+        if (!gCandidates.empty()) { PostMessageW(gMain, WM_SELECT_CANDIDATE, static_cast<WPARAM>(CurrentPageStart() + gCandidateFocus), 0); return 1; }
         if (!gComposition.empty()) return 1;
         return CallNextHookEx(gHook, code, wParam, lParam);
     }
@@ -1013,7 +1173,7 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         if (!gCandidates.empty()) {
             size_t candidateOffset = topRowDigit ? static_cast<size_t>(vk - '1') : static_cast<size_t>(vk - VK_NUMPAD1);
             size_t index = CurrentPageStart() + candidateOffset;
-            if (index < gCandidates.size() && candidateOffset < CurrentPageSize()) SelectCandidate(index);
+            if (index < gCandidates.size() && candidateOffset < CurrentPageSize()) PostMessageW(gMain, WM_SELECT_CANDIDATE, static_cast<WPARAM>(index), 0);
             return 1;
         }
         if (!gComposition.empty()) return 1;
@@ -1021,10 +1181,250 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(gHook, code, wParam, lParam);
 }
 
+bool AddTrayIcon() {
+    NOTIFYICONDATAW tray{};
+    tray.cbSize = sizeof(tray);
+    tray.hWnd = gMain;
+    tray.uID = TRAY_ID;
+    tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    tray.uCallbackMessage = WM_TRAY;
+    tray.hIcon = LoadIcon(nullptr, gEnabled ? IDI_INFORMATION : IDI_APPLICATION);
+    if (!gEnabled) wcscpy_s(tray.szTip, L"粵語候選字：關閉（Ctrl+Alt+G 開啟）");
+    else if (gEnglishMode) wcscpy_s(tray.szTip, L"粵語候選字：EN（Shift 切換至中文）");
+    else wcscpy_s(tray.szTip, L"粵語候選字：中（Shift 切換至英文）");
+    return Shell_NotifyIconW(NIM_ADD, &tray) != FALSE;
+}
+
+bool ReinstallInputServices() {
+    if (gHmpaCompatibilityMode) {
+        gStatus = L"安全相容模式已啟用：不會安裝全域鍵盤掛鈎";
+        gLastWorkerDetail = L"已保持安全相容輸入面板；沒有重新安裝鍵盤掛鈎";
+        AppendDiagnosticLog(L"manual repair kept safe compatibility mode; global hook not installed");
+        ShowSafePad();
+        UpdateRepairPanel();
+        return true;
+    }
+    ClearComposition();
+    UnregisterHotKey(gMain, HOTKEY_ID);
+    bool hotkeyOk = RegisterHotKey(gMain, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G') != FALSE;
+    if (gHook) { UnhookWindowsHookEx(gHook); gHook = nullptr; }
+    gHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, gInstance, 0);
+    bool hookOk = gHook != nullptr;
+    AddTrayIcon();
+    UpdateTrayIcon();
+    AppendDiagnosticLog(L"manual repair hotkey=" + std::to_wstring(hotkeyOk) + L" hook=" + std::to_wstring(hookOk));
+    gStatus = (hotkeyOk && hookOk) ? L"修復完成：鍵盤掛鈎、快捷鍵及系統匣已重新初始化" : L"部分修復失敗；請開啟 diagnostics.log 並重新啟動程式";
+    QueueCandidateRefresh();
+    SetTimer(gMain, TIMER_STATUS, 3500, nullptr);
+    return hotkeyOk && hookOk;
+}
+
+std::wstring RepairPanelText() {
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG hookAge = gLastHookTick ? now - gLastHookTick : 0;
+    const ULONGLONG candidateAge = gLastCandidateStartTick ? now - gLastCandidateStartTick : 0;
+    std::wstring text = L"CantoCandidate Online 修復中心\r\n\r\n";
+    text += L"輸入：" + std::wstring(gEnabled ? L"已開啟" : L"已關閉") + L"　模式：" + (gEnglishMode ? L"英文" : L"粵語拼音") + L"\r\n";
+    text += L"鍵盤掛鈎：" + std::wstring(gHook ? L"已安裝" : L"未安裝") + L"　最近按鍵：" + (gLastHookTick ? std::to_wstring(hookAge) + L" ms 前" : L"尚未收到") + L"\r\n";
+    text += L"候選工作：" + std::wstring(gCandidateWorkerActive ? L"處理中" : L"閒置") + L"　工作時間：" + (gCandidateWorkerActive ? std::to_wstring(candidateAge) + L" ms" : std::to_wstring(gLastCandidateDurationMs) + L" ms") + L"\r\n";
+    text += L"目前狀態：" + gLastWorkerDetail + L"\r\n";
+    text += L"診斷記錄：" + DiagnosticsPath() + L"\r\n\r\n";
+    text += L"「立即修復」會重新建立鍵盤掛鈎、快捷鍵與系統匣；不會改動你的詞庫或歷史。";
+    return text;
+}
+
+void UpdateRepairPanel() {
+    if (gRepairStatusControl && IsWindow(gRepairStatusControl)) SetWindowTextW(gRepairStatusControl, RepairPanelText().c_str());
+}
+
+void ShowRepairPanel();
+
+LRESULT CALLBACK RepairPanelProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+        case WM_CREATE: {
+            HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+            gRepairStatusControl = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                16, 16, 570, 160, hwnd, reinterpret_cast<HMENU>(ID_REPAIR_STATUS), gInstance, nullptr);
+            HWND repair = CreateWindowW(L"BUTTON", L"立即修復", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                16, 190, 130, 32, hwnd, reinterpret_cast<HMENU>(ID_REPAIR_FIX), gInstance, nullptr);
+            HWND openLog = CreateWindowW(L"BUTTON", L"開啟診斷記錄", WS_CHILD | WS_VISIBLE,
+                158, 190, 150, 32, hwnd, reinterpret_cast<HMENU>(ID_REPAIR_LOG), gInstance, nullptr);
+            HWND close = CreateWindowW(L"BUTTON", L"關閉", WS_CHILD | WS_VISIBLE,
+                468, 190, 118, 32, hwnd, reinterpret_cast<HMENU>(ID_REPAIR_CLOSE), gInstance, nullptr);
+            SendMessageW(gRepairStatusControl, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            SendMessageW(repair, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            SendMessageW(openLog, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            SendMessageW(close, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            SetTimer(hwnd, TIMER_REPAIR_PANEL, 400, nullptr);
+            UpdateRepairPanel();
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == ID_REPAIR_FIX) { ReinstallInputServices(); UpdateRepairPanel(); return 0; }
+            if (LOWORD(wParam) == ID_REPAIR_LOG) {
+                AppendDiagnosticLog(L"repair center opened diagnostics log");
+                ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DiagnosticsPath().c_str(), nullptr, SW_SHOWNORMAL);
+                return 0;
+            }
+            if (LOWORD(wParam) == ID_REPAIR_CLOSE) { DestroyWindow(hwnd); return 0; }
+            break;
+        case WM_TIMER:
+            if (wParam == TIMER_REPAIR_PANEL) { UpdateRepairPanel(); return 0; }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            KillTimer(hwnd, TIMER_REPAIR_PANEL);
+            gRepairStatusControl = nullptr;
+            gRepairWindow = nullptr;
+            return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+void ShowRepairPanel() {
+    if (gRepairWindow && IsWindow(gRepairWindow)) {
+        ShowWindow(gRepairWindow, SW_SHOWNORMAL);
+        SetForegroundWindow(gRepairWindow);
+        UpdateRepairPanel();
+        return;
+    }
+    gRepairWindow = CreateWindowExW(WS_EX_DLGMODALFRAME, L"CantoCandidateOnlineRepair", L"CantoCandidate Online 修復中心",
+        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 620, 280,
+        gMain, nullptr, gInstance, nullptr);
+    if (!gRepairWindow) {
+        AppendDiagnosticLog(L"repair center creation failed error=" + std::to_wstring(GetLastError()));
+        return;
+    }
+    ShowWindow(gRepairWindow, SW_SHOWNORMAL);
+    UpdateWindow(gRepairWindow);
+    AppendDiagnosticLog(L"repair center opened");
+}
+
+void ShowDiagnosticsPanel() { ShowRepairPanel(); }
+
+
+void UpdateSafePad() {
+    if (!gSafePadWindow || !IsWindow(gSafePadWindow)) return;
+    if (gSafeStatusControl) {
+        std::wstring detail = gCandidateWorkerActive ? L"正在查詢 Google 粵語候選…" :
+            (gStatus.empty() ? L"輸入粵拼後按「搜尋」；按候選可複製，再到目標程式按 Ctrl+V。" : gStatus);
+        SetWindowTextW(gSafeStatusControl, detail.c_str());
+    }
+    if (!gSafeResultsControl) return;
+    SendMessageW(gSafeResultsControl, LB_RESETCONTENT, 0, 0);
+    for (size_t index = 0; index < gCandidates.size() && index < 45; ++index) {
+        std::wstring item = std::to_wstring(index + 1) + L". " + gCandidates[index];
+        LRESULT position = SendMessageW(gSafeResultsControl, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
+        if (position != LB_ERR && position != LB_ERRSPACE) SendMessageW(gSafeResultsControl, LB_SETITEMDATA, static_cast<WPARAM>(position), static_cast<LPARAM>(index));
+    }
+    if (!gCandidates.empty()) SendMessageW(gSafeResultsControl, LB_SETCURSEL, 0, 0);
+}
+
+void RequestSafePadCandidates() {
+    if (!gSafeInputControl) return;
+    wchar_t text[MAX_COMPOSITION_CHARS + 1]{};
+    GetWindowTextW(gSafeInputControl, text, MAX_COMPOSITION_CHARS + 1);
+    gComposition = CompactLower(text);
+    gCandidates.clear();
+    gFuzzyHint.clear();
+    gStatus = gComposition.empty() ? L"請先輸入粵拼" : L"正在查詢…";
+    if (gComposition.empty()) { UpdateSafePad(); return; }
+    RequestCandidates();
+    UpdateSafePad();
+}
+
+void CopySafePadSelection() {
+    if (!gSafeResultsControl) return;
+    LRESULT selected = SendMessageW(gSafeResultsControl, LB_GETCURSEL, 0, 0);
+    if (selected == LB_ERR) return;
+    LRESULT data = SendMessageW(gSafeResultsControl, LB_GETITEMDATA, static_cast<WPARAM>(selected), 0);
+    if (data == LB_ERR || static_cast<size_t>(data) >= gCandidates.size()) return;
+    const std::wstring word = gCandidates[static_cast<size_t>(data)];
+    const std::wstring composition = gComposition;
+    if (CopyTextToClipboard(word)) {
+        RecordHistory(composition, word);
+        RecordContext(gLastCommittedWord, word);
+        gLastCommittedWord = word;
+        gStatus = L"已複製「" + word + L"」；請到目標程式按 Ctrl+V 貼上";
+        AppendDiagnosticLog(L"safe compatibility candidate copied");
+    } else {
+        gStatus = L"無法寫入剪貼簿";
+        AppendDiagnosticLog(L"safe compatibility clipboard copy failed error=" + std::to_wstring(GetLastError()));
+    }
+    UpdateSafePad();
+}
+
+LRESULT CALLBACK SafePadProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+        case WM_CREATE: {
+            HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+            CreateWindowW(L"STATIC", L"安全相容模式：不安裝全域鍵盤掛鈎，候選會複製到剪貼簿。", WS_CHILD | WS_VISIBLE,
+                16, 14, 660, 22, hwnd, nullptr, gInstance, nullptr);
+            gSafeInputControl = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                16, 44, 475, 30, hwnd, reinterpret_cast<HMENU>(ID_SAFE_INPUT), gInstance, nullptr);
+            HWND search = CreateWindowW(L"BUTTON", L"搜尋", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                505, 44, 155, 30, hwnd, reinterpret_cast<HMENU>(ID_SAFE_SEARCH), gInstance, nullptr);
+            gSafeStatusControl = CreateWindowW(L"STATIC", L"輸入粵拼後按「搜尋」。", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                16, 86, 644, 32, hwnd, nullptr, gInstance, nullptr);
+            gSafeResultsControl = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
+                16, 122, 644, 205, hwnd, reinterpret_cast<HMENU>(ID_SAFE_RESULTS), gInstance, nullptr);
+            HWND copy = CreateWindowW(L"BUTTON", L"複製選取候選", WS_CHILD | WS_VISIBLE,
+                16, 342, 180, 32, hwnd, reinterpret_cast<HMENU>(ID_SAFE_COPY), gInstance, nullptr);
+            HWND clear = CreateWindowW(L"BUTTON", L"清除", WS_CHILD | WS_VISIBLE,
+                208, 342, 110, 32, hwnd, reinterpret_cast<HMENU>(ID_SAFE_CLEAR), gInstance, nullptr);
+            HWND close = CreateWindowW(L"BUTTON", L"關閉", WS_CHILD | WS_VISIBLE,
+                550, 342, 110, 32, hwnd, reinterpret_cast<HMENU>(ID_SAFE_CLOSE), gInstance, nullptr);
+            for (HWND control : {gSafeInputControl, search, gSafeStatusControl, gSafeResultsControl, copy, clear, close}) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            SetFocus(gSafeInputControl);
+            AppendDiagnosticLog(L"safe compatibility input panel opened");
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == ID_SAFE_SEARCH) { RequestSafePadCandidates(); return 0; }
+            if (LOWORD(wParam) == ID_SAFE_COPY) { CopySafePadSelection(); return 0; }
+            if (LOWORD(wParam) == ID_SAFE_CLEAR) {
+                if (gSafeInputControl) SetWindowTextW(gSafeInputControl, L"");
+                ClearComposition();
+                UpdateSafePad();
+                SetFocus(gSafeInputControl);
+                return 0;
+            }
+            if (LOWORD(wParam) == ID_SAFE_CLOSE) { DestroyWindow(hwnd); return 0; }
+            if (LOWORD(wParam) == ID_SAFE_RESULTS && HIWORD(wParam) == LBN_DBLCLK) { CopySafePadSelection(); return 0; }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            gSafeInputControl = nullptr;
+            gSafeResultsControl = nullptr;
+            gSafeStatusControl = nullptr;
+            gSafePadWindow = nullptr;
+            return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+void ShowSafePad() {
+    if (gSafePadWindow && IsWindow(gSafePadWindow)) {
+        ShowWindow(gSafePadWindow, SW_SHOWNORMAL);
+        SetForegroundWindow(gSafePadWindow);
+        SetFocus(gSafeInputControl);
+        return;
+    }
+    gSafePadWindow = CreateWindowExW(WS_EX_DLGMODALFRAME, L"CantoCandidateOnlineSafePad", L"CantoCandidate Online — 安全相容輸入",
+        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 700, 430,
+        gMain, nullptr, gInstance, nullptr);
+    if (!gSafePadWindow) AppendDiagnosticLog(L"safe compatibility input panel creation failed error=" + std::to_wstring(GetLastError()));
+    else { ShowWindow(gSafePadWindow, SW_SHOWNORMAL); UpdateWindow(gSafePadWindow); }
+}
+
 void ShowTrayMenu() {
     POINT point{}; GetCursorPos(&point);
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, 1, gEnabled ? L"關閉粵語輸入" : L"開啟粵語輸入");
+    AppendMenuW(menu, MF_STRING, 1, gHmpaCompatibilityMode ? L"開啟安全相容輸入面板…" : (gEnabled ? L"關閉粵語輸入" : L"開啟粵語輸入"));
     AppendMenuW(menu, MF_STRING, 2, gEnglishMode ? L"切換至中文模式（Shift）" : L"切換至英文模式（Shift）");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 3, L"開啟常用短語");
@@ -1039,11 +1439,12 @@ void ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING, 11, L"清除離線候選快取");
     AppendMenuW(menu, MF_STRING, 12, L"清除所有本機資料…");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 13, L"結束程式");
+    AppendMenuW(menu, MF_STRING, 13, L"開啟修復中心…");
+    AppendMenuW(menu, MF_STRING, 14, L"結束程式");
     SetForegroundWindow(gMain);
     int choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, point.x, point.y, 0, gMain, nullptr);
     DestroyMenu(menu);
-    if (choice == 1) ToggleInput();
+    if (choice == 1) { if (gHmpaCompatibilityMode) ShowSafePad(); else ToggleInput(); }
     if (choice == 2) ToggleLanguageMode();
     if (choice == 3) { EnsureSnippetsFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"snippets.tsv").c_str(), nullptr, SW_SHOWNORMAL); }
     if (choice == 4) { EnsureDictionaryFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"custom_dictionary.tsv").c_str(), nullptr, SW_SHOWNORMAL); }
@@ -1055,32 +1456,78 @@ void ShowTrayMenu() {
     if (choice == 10) { ClearContextHistory(); gStatus = L"已清除語境歷史"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
     if (choice == 11) { ClearCandidateCache(); gStatus = L"已清除離線候選快取"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
     if (choice == 12 && MessageBoxW(gMain, L"會清除短語、詞庫、選字歷史、語境歷史與離線候選快取。此操作無法復原，是否繼續？", L"CantoCandidate", MB_YESNO | MB_ICONWARNING) == IDYES) {
-        const wchar_t* files[] = {L"snippets.tsv", L"custom_dictionary.tsv", L"history.tsv", L"context_history.tsv", L"candidate_cache.tsv"};
-        for (const wchar_t* file : files) { std::wstring path = DataFilePath(file); if (IsSafeDataPath(path)) DeleteFileW(path.c_str()); }
-        gLastCommittedWord.clear(); EnsureSnippetsFile(); EnsureDictionaryFile();
+        {
+            std::lock_guard<std::mutex> lock(gLocalDataMutex);
+            const wchar_t* files[] = {L"snippets.tsv", L"custom_dictionary.tsv", L"history.tsv", L"context_history.tsv", L"candidate_cache.tsv"};
+            for (const wchar_t* file : files) { std::wstring path = DataFilePath(file); if (IsSafeDataPath(path)) DeleteFileW(path.c_str()); }
+            gLastCommittedWord.clear(); EnsureSnippetsFile(); EnsureDictionaryFile();
+        }
         gStatus = L"已清除本機資料"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr);
     }
-    if (choice == 13) PostMessage(gMain, WM_CLOSE, 0, 0);
+    if (choice == 13) ShowDiagnosticsPanel();
+    if (choice == 14) PostMessage(gMain, WM_CLOSE, 0, 0);
 }
 
 LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (gTaskbarCreatedMessage && message == gTaskbarCreatedMessage) {
+        if (AddTrayIcon()) AppendDiagnosticLog(L"system tray recreated after Explorer restart");
+        return 0;
+    }
+    if (message == WM_OPEN_REPAIR_PANEL) { ShowRepairPanel(); return 0; }
+    if (message == WM_OPEN_SAFE_PAD) { ShowSafePad(); return 0; }
     switch (message) {
         case WM_HOTKEY:
             if (wParam == HOTKEY_ID) ToggleInput();
             return 0;
         case WM_CANDIDATES_READY: {
+            gCandidateWorkerActive = false;
+            gLastCandidateDoneTick = GetTickCount64();
+            gLastCandidateDurationMs = gLastCandidateStartTick ? gLastCandidateDoneTick - gLastCandidateStartTick : 0;
             CandidateResult* result = reinterpret_cast<CandidateResult*>(lParam);
-            if (result && gEnabled && result->composition == gComposition) {
+            if (result && (gEnabled || gHmpaCompatibilityMode) && result->composition == gComposition) {
                 gCandidates = result->candidates;
                 gFuzzyHint = result->fuzzyHint;
                 gCandidatePage = 0;
                 gCandidateFocus = 0;
                 gStatus = result->error;
-                ResizeAndShowCandidate();
+                gLastWorkerDetail = result->error.empty() ? L"候選請求完成" : result->error;
+                if (gHmpaCompatibilityMode) UpdateSafePad(); else ResizeAndShowCandidate();
+                UpdateRepairPanel();
             }
             delete result;
+            UpdateRepairPanel();
+            if (!gQueuedCandidateRequest.empty()) {
+                std::wstring queued = gQueuedCandidateRequest;
+                gQueuedCandidateRequest.clear();
+                if ((gEnabled || gHmpaCompatibilityMode) && queued == gComposition) RequestCandidates();
+            }
             return 0;
         }
+        case WM_CANDIDATE_REFRESH:
+            InterlockedExchange(&gRefreshQueued, 0);
+            ResizeAndShowCandidate();
+            return 0;
+        case WM_REQUEST_CANDIDATES:
+            ProcessCandidateRequest();
+            return 0;
+        case WM_SELECT_CANDIDATE:
+            SelectCandidate(static_cast<size_t>(wParam));
+            return 0;
+        case WM_EXPAND_SNIPPET:
+            if (!ExpandSnippetComposition()) {
+                gStatus = L"找不到短語；可右擊系統匣開啟 snippets.tsv";
+                ResizeAndShowCandidate();
+                SetTimer(gMain, TIMER_STATUS, 1800, nullptr);
+            }
+            return 0;
+        case WM_PASTE_TEXT: {
+            std::wstring* payload = reinterpret_cast<std::wstring*>(lParam);
+            if (payload) { PasteText(*payload); delete payload; }
+            return 0;
+        }
+        case WM_TRAY_REFRESH:
+            UpdateTrayIcon();
+            return 0;
         case WM_TIMER:
             if (wParam == TIMER_STATUS) { KillTimer(hwnd, TIMER_STATUS); if (gComposition.empty()) { gStatus.clear(); ShowWindow(gCandidateWindow, SW_HIDE); } }
             if (wParam == TIMER_REQUEST) {
@@ -1091,15 +1538,18 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             return 0;
         case WM_TRAY:
             if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) ShowTrayMenu();
-            if (lParam == WM_LBUTTONUP) ToggleInput();
+            if (lParam == WM_LBUTTONUP) { if (gHmpaCompatibilityMode) ShowSafePad(); else ToggleInput(); }
             return 0;
         case WM_CLOSE:
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY: {
+            gShuttingDown.store(true);
+            AppendDiagnosticLog(L"clean shutdown requested");
             RestoreClipboardIfUnchanged();
             UnregisterHotKey(hwnd, HOTKEY_ID);
             if (gHook) UnhookWindowsHookEx(gHook);
+            if (gSingleInstanceMutex) { CloseHandle(gSingleInstanceMutex); gSingleInstanceMutex = nullptr; }
             NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = hwnd; data.uID = TRAY_ID;
             Shell_NotifyIconW(NIM_DELETE, &data);
             PostQuitMessage(0);
@@ -1110,10 +1560,24 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    gSingleInstanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\CantoCandidateOnline_Stable_2026");
+    if (!gSingleInstanceMutex) return 1;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowW(L"CantoCandidateOnlineMain", nullptr);
+        if (existing) PostMessageW(existing, WM_OPEN_REPAIR_PANEL, 0, 0);
+        CloseHandle(gSingleInstanceMutex);
+        return 0;
+    }
+    ReleaseMutex(gSingleInstanceMutex);
+    SetUnhandledExceptionFilter(CantoUnhandledExceptionFilter);
     OleInitialize(nullptr);
     gInstance = instance;
-    const wchar_t* mainClass = L"CantoCandidateMain";
+    gTaskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+    AppendDiagnosticLog(L"startup");
+    const wchar_t* mainClass = L"CantoCandidateOnlineMain";
     const wchar_t* candidateClass = L"CantoCandidatePopup";
+    const wchar_t* repairClass = L"CantoCandidateOnlineRepair";
+    const wchar_t* safePadClass = L"CantoCandidateOnlineSafePad";
     WNDCLASSW mainWindow{};
     mainWindow.hInstance = instance;
     mainWindow.lpszClassName = mainClass;
@@ -1125,21 +1589,46 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     popupWindow.lpfnWndProc = CandidateWindowProc;
     popupWindow.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&popupWindow);
+    WNDCLASSW repairWindow{};
+    repairWindow.hInstance = instance;
+    repairWindow.lpszClassName = repairClass;
+    repairWindow.lpfnWndProc = RepairPanelProc;
+    repairWindow.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    repairWindow.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    RegisterClassW(&repairWindow);
+    WNDCLASSW safePadWindow{};
+    safePadWindow.hInstance = instance;
+    safePadWindow.lpszClassName = safePadClass;
+    safePadWindow.lpfnWndProc = SafePadProc;
+    safePadWindow.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    safePadWindow.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    RegisterClassW(&safePadWindow);
     EnsureDictionaryFile();
     EnsureSnippetsFile();
     LoadSettings();
     gMain = CreateWindowExW(0, mainClass, L"CantoCandidate", WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
     gCandidateWindow = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, candidateClass, L"", WS_POPUP, 0, 0, 0, 0, gMain, nullptr, instance, nullptr);
-    RegisterHotKey(gMain, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G');
-    gHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, instance, 0);
-    NOTIFYICONDATAW tray{};
-    tray.cbSize = sizeof(tray); tray.hWnd = gMain; tray.uID = TRAY_ID;
-    tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP; tray.uCallbackMessage = WM_TRAY;
-    tray.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wcscpy_s(tray.szTip, L"粵語候選字：關閉（Ctrl+Alt+G 開啟）");
-    Shell_NotifyIconW(NIM_ADD, &tray);
+    gHmpaCompatibilityMode = GetModuleHandleW(L"hmpalert.dll") != nullptr;
+    if (gHmpaCompatibilityMode) {
+        gStatus = L"已偵測 Sophos／HitmanPro.Alert；使用安全相容輸入面板";
+        gLastWorkerDetail = L"安全相容模式：未安裝全域鍵盤掛鈎";
+        AppendDiagnosticLog(L"hmpalert.dll detected; global keyboard hook disabled and safe compatibility mode enabled");
+    } else {
+        if (!RegisterHotKey(gMain, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G')) {
+            AppendDiagnosticLog(L"startup hotkey registration failed error=" + std::to_wstring(GetLastError()));
+        }
+        gHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, instance, 0);
+        if (!gHook) AppendDiagnosticLog(L"startup keyboard hook failed error=" + std::to_wstring(GetLastError()));
+    }
+    if (!AddTrayIcon()) AppendDiagnosticLog(L"startup tray creation failed error=" + std::to_wstring(GetLastError()));
+    if (gHmpaCompatibilityMode) PostMessageW(gMain, WM_OPEN_SAFE_PAD, 0, 0);
     MSG message{};
-    while (GetMessageW(&message, nullptr, 0, 0)) { TranslateMessage(&message); DispatchMessageW(&message); }
+    int getMessageResult = 0;
+    while ((getMessageResult = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    if (getMessageResult == -1) AppendDiagnosticLog(L"GetMessage failed error=" + std::to_wstring(GetLastError()));
     OleUninitialize();
     return 0;
 }
