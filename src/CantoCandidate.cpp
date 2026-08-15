@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <shellapi.h>
+#include <ole2.h>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -20,6 +21,7 @@ constexpr UINT WM_CANDIDATES_READY = WM_APP + 1;
 constexpr UINT WM_TRAY = WM_APP + 2;
 constexpr UINT TIMER_STATUS = 42;
 constexpr UINT TIMER_REQUEST = 43;
+constexpr UINT TIMER_CLIPBOARD_RESTORE = 44;
 constexpr size_t MAX_COMPOSITION_CHARS = 64;
 constexpr size_t MAX_RESPONSE_BYTES = 1024 * 1024;
 constexpr int HOTKEY_ID = 100;
@@ -42,6 +44,15 @@ std::wstring gComposition;
 std::vector<std::wstring> gCandidates;
 std::wstring gStatus;
 std::wstring gFuzzyHint;
+
+struct Settings {
+    bool followCaret = true;
+    bool preserveClipboard = true;
+    bool singleShiftToggle = true;
+};
+Settings gSettings;
+IDataObject* gClipboardBackup = nullptr;
+DWORD gClipboardSequenceAfterPaste = 0;
 
 void ResizeAndShowCandidate();
 void UpdateTrayIcon();
@@ -130,6 +141,37 @@ bool WriteUtf8File(const std::wstring& path, const std::string& data, DWORD crea
     bool ok = data.empty() || WriteFile(file, data.data(), static_cast<DWORD>(data.size()), &written, nullptr);
     CloseHandle(file);
     return ok && written == data.size();
+}
+
+bool ReadSettingValue(const std::wstring& data, const std::wstring& key, bool fallback) {
+    std::wstringstream lines(data);
+    std::wstring line;
+    while (std::getline(lines, line)) {
+        if (line.empty() || line[0] == L'#' || line[0] == L';') continue;
+        size_t equals = line.find(L'=');
+        if (equals == std::wstring::npos) continue;
+        std::wstring name = line.substr(0, equals);
+        std::wstring value = line.substr(equals + 1);
+        if (name != key) continue;
+        if (value == L"1") return true;
+        if (value == L"0") return false;
+        return fallback;
+    }
+    return fallback;
+}
+
+void EnsureSettingsFile() {
+    const std::string starter = "; CantoCandidate settings (0=off, 1=on)\nfollow_caret=1\npreserve_clipboard=1\nsingle_shift_toggle=1\n";
+    WriteUtf8File(DataFilePath(L"settings.ini"), starter, CREATE_NEW);
+}
+
+void LoadSettings() {
+    EnsureSettingsFile();
+    std::wstring data = Utf8ToWide(ReadUtf8File(DataFilePath(L"settings.ini")));
+    if (data.empty()) return;
+    gSettings.followCaret = ReadSettingValue(data, L"follow_caret", true);
+    gSettings.preserveClipboard = ReadSettingValue(data, L"preserve_clipboard", true);
+    gSettings.singleShiftToggle = ReadSettingValue(data, L"single_shift_toggle", true);
 }
 
 struct HistoryEntry {
@@ -410,12 +452,24 @@ std::wstring CandidateDisplayText() {
     return display;
 }
 
+bool TryGetCaretAnchor(POINT& point) {
+    HWND foreground = GetForegroundWindow();
+    if (!foreground) return false;
+    DWORD threadId = GetWindowThreadProcessId(foreground, nullptr);
+    GUITHREADINFO info{};
+    info.cbSize = sizeof(info);
+    if (!threadId || !GetGUIThreadInfo(threadId, &info) || !info.hwndCaret) return false;
+    point.x = info.rcCaret.left;
+    point.y = info.rcCaret.bottom;
+    return ClientToScreen(info.hwndCaret, &point) != FALSE;
+}
+
 void ResizeAndShowCandidate() {
     if (!gCandidateWindow) return;
     std::wstring display = CandidateDisplayText();
     if (display.empty()) { ShowWindow(gCandidateWindow, SW_HIDE); return; }
     POINT point{};
-    GetCursorPos(&point);
+    if (!gSettings.followCaret || !TryGetCaretAnchor(point)) GetCursorPos(&point);
     int width = 820;
     int height = 82;
     int x = std::max(4L, point.x - 20L);
@@ -440,9 +494,28 @@ void ClearComposition() {
     ShowWindow(gCandidateWindow, SW_HIDE);
 }
 
+void ReleaseClipboardBackup() {
+    KillTimer(gMain, TIMER_CLIPBOARD_RESTORE);
+    if (gClipboardBackup) {
+        gClipboardBackup->Release();
+        gClipboardBackup = nullptr;
+    }
+    gClipboardSequenceAfterPaste = 0;
+}
+
+void RestoreClipboardIfUnchanged() {
+    KillTimer(gMain, TIMER_CLIPBOARD_RESTORE);
+    if (gClipboardBackup && GetClipboardSequenceNumber() == gClipboardSequenceAfterPaste) {
+        OleSetClipboard(gClipboardBackup);
+    }
+    ReleaseClipboardBackup();
+}
+
 void PasteText(const std::wstring& text) {
     if (text.empty()) return;
-    if (!OpenClipboard(nullptr)) return;
+    RestoreClipboardIfUnchanged();
+    if (gSettings.preserveClipboard) OleGetClipboard(&gClipboardBackup);
+    if (!OpenClipboard(nullptr)) { ReleaseClipboardBackup(); return; }
     EmptyClipboard();
     SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
     HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
@@ -463,6 +536,10 @@ void PasteText(const std::wstring& text) {
     input[2].type = INPUT_KEYBOARD; input[2].ki.wVk = 'V'; input[2].ki.dwFlags = KEYEVENTF_KEYUP;
     input[3].type = INPUT_KEYBOARD; input[3].ki.wVk = VK_CONTROL; input[3].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(4, input, sizeof(INPUT));
+    if (gClipboardBackup) {
+        gClipboardSequenceAfterPaste = GetClipboardSequenceNumber();
+        SetTimer(gMain, TIMER_CLIPBOARD_RESTORE, 150, nullptr);
+    }
 }
 
 void SelectCandidate(size_t index) {
@@ -571,7 +648,7 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     DWORD vk = key->vkCode;
     bool keyUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
     if (keyUp) {
-        if (gEnabled && vk == VK_SHIFT) {
+        if (gEnabled && gSettings.singleShiftToggle && vk == VK_SHIFT) {
             if (gShiftDown && !gShiftUsed) ToggleLanguageMode();
             gShiftDown = false;
         }
@@ -579,8 +656,10 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     }
     if (!gEnabled || (wParam != WM_KEYDOWN && wParam != WM_SYSKEYDOWN)) return CallNextHookEx(gHook, code, wParam, lParam);
     if (vk == VK_SHIFT) {
-        gShiftDown = true;
-        gShiftUsed = false;
+        if (gSettings.singleShiftToggle) {
+            gShiftDown = true;
+            gShiftUsed = false;
+        }
         return CallNextHookEx(gHook, code, wParam, lParam);
     }
     if (gShiftDown) gShiftUsed = true;
@@ -656,17 +735,19 @@ void ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING, 2, gEnglishMode ? L"切換至中文模式（Shift）" : L"切換至英文模式（Shift）");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 3, L"開啟自訂詞庫");
-    AppendMenuW(menu, MF_STRING, 4, L"清除本機選字歷史");
+    AppendMenuW(menu, MF_STRING, 4, L"開啟設定檔");
+    AppendMenuW(menu, MF_STRING, 5, L"清除本機選字歷史");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 5, L"結束程式");
+    AppendMenuW(menu, MF_STRING, 6, L"結束程式");
     SetForegroundWindow(gMain);
     int choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, point.x, point.y, 0, gMain, nullptr);
     DestroyMenu(menu);
     if (choice == 1) ToggleInput();
     if (choice == 2) ToggleLanguageMode();
     if (choice == 3) { EnsureDictionaryFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"custom_dictionary.tsv").c_str(), nullptr, SW_SHOWNORMAL); }
-    if (choice == 4) { ClearHistoryFile(); gStatus = L"已清除本機選字歷史"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
-    if (choice == 5) PostMessage(gMain, WM_CLOSE, 0, 0);
+    if (choice == 4) { EnsureSettingsFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"settings.ini").c_str(), nullptr, SW_SHOWNORMAL); }
+    if (choice == 5) { ClearHistoryFile(); gStatus = L"已清除本機選字歷史"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
+    if (choice == 6) PostMessage(gMain, WM_CLOSE, 0, 0);
 }
 
 LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -693,6 +774,7 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 KillTimer(hwnd, TIMER_REQUEST);
                 if (!gPendingComposition.empty() && gPendingComposition == gComposition) RequestCandidates();
             }
+            if (wParam == TIMER_CLIPBOARD_RESTORE) RestoreClipboardIfUnchanged();
             return 0;
         case WM_TRAY:
             if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) ShowTrayMenu();
@@ -702,6 +784,7 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY: {
+            RestoreClipboardIfUnchanged();
             UnregisterHotKey(hwnd, HOTKEY_ID);
             if (gHook) UnhookWindowsHookEx(gHook);
             NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = hwnd; data.uID = TRAY_ID;
@@ -714,6 +797,7 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    OleInitialize(nullptr);
     gInstance = instance;
     const wchar_t* mainClass = L"CantoCandidateMain";
     const wchar_t* candidateClass = L"CantoCandidatePopup";
@@ -729,6 +813,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     popupWindow.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&popupWindow);
     EnsureDictionaryFile();
+    LoadSettings();
     gMain = CreateWindowExW(0, mainClass, L"CantoCandidate", WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
     gCandidateWindow = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, candidateClass, L"", WS_POPUP, 0, 0, 0, 0, gMain, nullptr, instance, nullptr);
     RegisterHotKey(gMain, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G');
@@ -741,5 +826,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     Shell_NotifyIconW(NIM_ADD, &tray);
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0)) { TranslateMessage(&message); DispatchMessageW(&message); }
+    OleUninitialize();
     return 0;
 }
