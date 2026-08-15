@@ -1,4 +1,4 @@
-# 粵語候選字工具（Windows 11 可攜版 v0.7）
+# 粵語候選字工具（Windows 11 可攜版 v0.8）
 
 這是一個 **免安裝、單一執行檔** 的 Windows x64 粵語輸入輔助工具。它在使用者主動開啟中文模式後，將近似英文拼音送往 Google Input Tools 的粵語候選字服務，顯示多頁候選字，並把選取結果貼入目前的程式。它並非 Google 官方產品，亦不是 Windows 語言列內的原生 IME。
 
@@ -68,6 +68,21 @@ m4goi	唔該
 
 新拼音需要網絡才可取得 Google 候選字；但服務無回應時，程式會嘗試使用同資料夾 `candidate_cache.tsv` 的離線候選快取。容錯是 Google 候選服務的配對結果，並非保證任意錯拼都能找回原來字詞；錯得太遠時，最合理的另一個讀音可能會排到前面，因此請留意候選列而不要盲目按第一個。
 
+## v0.8：本機近音建議與語境排序
+
+v0.8 不會聲稱複製 Google 未公開的排序。線上候選仍以 Google 原始結果為準；只有當服務無回應或沒有候選時，程式才會從既有 `candidate_cache.tsv` 以本機近音規則找後備候選。近音結果會清楚標示「離線本機近音建議」和實際匹配的拼音，不會額外發出網絡請求。
+
+本機近音規則包括 `n/l`、首音 `ng` 有／無、`h/f`、尾音 `ng/n`、單一字母刪除和相鄰字母交換；最多只嘗試 8 個變體。首次離線輸入未曾快取的錯拼，並不會有候選，這是刻意避免誤導和避免新增隱藏網絡行為的設計。
+
+每次你**確認上屏**一個候選詞，程式可在 `context_history.tsv` 寫入與上一個已確認詞的相鄰關係。下次同一前詞後輸入拼音時，只對已知關係候選作小幅本機排序；它不記錄完整句子、按鍵原文、視窗文字或任何雲端資料。
+
+| 新設定 | 預設值 | 說明 |
+|---|---:|---|
+| `local_fuzzy_suggestions` | `1` | `1` 允許只用離線快取的本機近音後備；`0` 完全停用。 |
+| `context_ranking` | `1` | `1` 保存並使用已確認相鄰詞作輕量排序；`0` 停用保存和排序。 |
+
+右擊系統匣圖示可開啟或清除「語境歷史」；選「清除所有本機資料」也會一併移除它。
+
 ## v0.7：常用短語、離線候選與資料管理
 
 短語定義在 `snippets.tsv`：輸入 `;addr`、`;email` 或 `;thanks`，再按 `Space` 或 `Enter`，即會展開本機定義的文字；短語不會送到候選服務。可右擊系統匣圖示選「開啟常用短語」直接編輯 TSV。
@@ -103,10 +118,10 @@ v0.6 預設會嘗試把候選窗顯示在目前文字游標（caret）下方；�
 
 v0.5 已加入遠端回應 1 MiB 上限、組字長度 64 字元上限、120 ms 候選請求合併延遲、本機詞庫重新解析點防護、詞庫 1 MiB 上限，以及固定使用 Windows 系統目錄的記事本。完整結果見 `SECURITY_AUDIT_REPORT.md` 與 `SECURITY_AUDIT_SCOPE.md`。
 
-每次交付都附帶 SHA-256。請在 Windows 開啟 PowerShell 並執行以下命令，再與 `CHECKSUMS-SHA256-v0.7.txt` 比較：
+每次交付都附帶 SHA-256。請在 Windows 開啟 PowerShell 並執行以下命令，再與 `CHECKSUMS-SHA256-v0.8.txt` 比較：
 
 ```powershell
-Get-FileHash .\CantoCandidate-Win11-Portable-v0.7.zip -Algorithm SHA256
+Get-FileHash .\CantoCandidate-Win11-Portable-v0.8.zip -Algorithm SHA256
 ```
 
 解壓後亦建議以 Windows Defender 掃描 `CantoCandidate.exe`。程式未有商業程式碼簽章，只有在你信任來源並核對雜湊後才應執行。

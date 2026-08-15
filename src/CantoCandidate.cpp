@@ -54,10 +54,13 @@ struct Settings {
     int candidateFontSize = 22;
     int candidatePageSize = 9;
     wchar_t snippetPrefix = L';';
+    bool localFuzzySuggestions = true;
+    bool contextRanking = true;
 };
 Settings gSettings;
 IDataObject* gClipboardBackup = nullptr;
 DWORD gClipboardSequenceAfterPaste = 0;
+std::wstring gLastCommittedWord;
 
 void ResizeAndShowCandidate();
 void UpdateTrayIcon();
@@ -187,7 +190,7 @@ int ReadSettingInteger(const std::wstring& data, const std::wstring& key, int fa
 }
 
 void EnsureSettingsFile() {
-    const std::string starter = "; CantoCandidate settings (0=off, 1=on)\n; Restart CantoCandidate after changing this file.\nfollow_caret=1\npreserve_clipboard=1\nsingle_shift_toggle=1\ndark_mode=1\ncandidate_font_size=22\ncandidate_page_size=9\nsnippet_prefix=;\n";
+    const std::string starter = "; CantoCandidate settings (0=off, 1=on)\n; Restart CantoCandidate after changing this file.\nfollow_caret=1\npreserve_clipboard=1\nsingle_shift_toggle=1\ndark_mode=1\ncandidate_font_size=22\ncandidate_page_size=9\nsnippet_prefix=;\nlocal_fuzzy_suggestions=1\ncontext_ranking=1\n";
     WriteUtf8File(DataFilePath(L"settings.ini"), starter, CREATE_NEW);
 }
 
@@ -203,6 +206,8 @@ void LoadSettings() {
     gSettings.candidatePageSize = ReadSettingInteger(data, L"candidate_page_size", 9, 5, static_cast<int>(MAX_PAGE_SIZE));
     std::wstring prefix = ReadSettingText(data, L"snippet_prefix");
     if (prefix.size() == 1 && !iswspace(prefix[0]) && prefix[0] < 128) gSettings.snippetPrefix = prefix[0];
+    gSettings.localFuzzySuggestions = ReadSettingValue(data, L"local_fuzzy_suggestions", true);
+    gSettings.contextRanking = ReadSettingValue(data, L"context_ranking", true);
 }
 
 struct HistoryEntry {
@@ -257,15 +262,81 @@ int HistoryScore(const std::vector<HistoryEntry>& history, const std::wstring& c
     return 0;
 }
 
+struct ContextEntry {
+    std::wstring previous;
+    std::wstring next;
+    int count = 0;
+};
+
+std::vector<ContextEntry> LoadContextHistory() {
+    std::vector<ContextEntry> entries;
+    std::wstring data = Utf8ToWide(ReadUtf8File(DataFilePath(L"context_history.tsv")));
+    std::wstringstream lines(data);
+    std::wstring line;
+    while (std::getline(lines, line)) {
+        size_t first = line.find(L'\t');
+        size_t second = first == std::wstring::npos ? std::wstring::npos : line.find(L'\t', first + 1);
+        if (first == std::wstring::npos || second == std::wstring::npos) continue;
+        try {
+            int count = std::max(0, std::stoi(line.substr(second + 1)));
+            if (count > 0) entries.push_back({line.substr(0, first), line.substr(first + 1, second - first - 1), count});
+        } catch (...) {}
+    }
+    return entries;
+}
+
+void SaveContextHistory(std::vector<ContextEntry> entries) {
+    if (entries.size() > 5000) {
+        std::sort(entries.begin(), entries.end(), [](const ContextEntry& a, const ContextEntry& b) { return a.count > b.count; });
+        entries.resize(5000);
+    }
+    std::wstring data;
+    for (const auto& entry : entries) data += entry.previous + L"\t" + entry.next + L"\t" + std::to_wstring(entry.count) + L"\n";
+    WriteUtf8File(DataFilePath(L"context_history.tsv"), WideToUtf8(data));
+}
+
+int ContextScore(const std::vector<ContextEntry>& entries, const std::wstring& previous, const std::wstring& next) {
+    if (previous.empty()) return 0;
+    for (const auto& entry : entries) if (entry.previous == previous && entry.next == next) return entry.count;
+    return 0;
+}
+
+void RecordContext(const std::wstring& previous, const std::wstring& next) {
+    if (!gSettings.contextRanking || previous.empty() || next.empty()) return;
+    std::vector<ContextEntry> entries = LoadContextHistory();
+    for (auto& entry : entries) {
+        if (entry.previous == previous && entry.next == next) {
+            entry.count = std::min(entry.count + 1, 1000000);
+            SaveContextHistory(entries);
+            return;
+        }
+    }
+    entries.push_back({previous, next, 1});
+    SaveContextHistory(entries);
+}
+
+void ClearContextHistory() {
+    std::wstring path = DataFilePath(L"context_history.tsv");
+    if (IsSafeDataPath(path)) DeleteFileW(path.c_str());
+    gLastCommittedWord.clear();
+}
+
 std::vector<std::wstring> PersonalizeCandidates(const std::wstring& composition, const std::vector<std::wstring>& remote) {
     std::vector<std::wstring> result = LoadCustomWords(composition);
     std::vector<HistoryEntry> history = LoadHistory();
-    std::vector<std::pair<std::wstring, int>> ranked;
+    std::vector<ContextEntry> context = gSettings.contextRanking ? LoadContextHistory() : std::vector<ContextEntry>{};
+    struct RankedCandidate { std::wstring word; int history; int context; };
+    std::vector<RankedCandidate> ranked;
     for (const auto& word : remote) {
-        if (std::find(result.begin(), result.end(), word) == result.end()) ranked.push_back({word, HistoryScore(history, composition, word)});
+        if (std::find(result.begin(), result.end(), word) == result.end()) {
+            ranked.push_back({word, HistoryScore(history, composition, word), ContextScore(context, gLastCommittedWord, word)});
+        }
     }
-    std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-    for (const auto& item : ranked) result.push_back(item.first);
+    std::stable_sort(ranked.begin(), ranked.end(), [](const RankedCandidate& a, const RankedCandidate& b) {
+        if (a.history != b.history) return a.history > b.history;
+        return a.context > b.context;
+    });
+    for (const auto& item : ranked) result.push_back(item.word);
     return result;
 }
 
@@ -365,6 +436,53 @@ std::vector<std::wstring> FindCachedCandidates(const std::wstring& composition) 
     std::vector<CandidateCacheEntry> entries = LoadCandidateCache();
     for (auto it = entries.rbegin(); it != entries.rend(); ++it) if (it->input == key) return it->candidates;
     return {};
+}
+
+struct FuzzyCacheMatch {
+    std::wstring matchedInput;
+    std::vector<std::wstring> candidates;
+};
+
+std::vector<std::wstring> LocalFuzzyVariants(const std::wstring& composition) {
+    std::wstring key = CompactLower(composition);
+    std::vector<std::wstring> variants;
+    auto add = [&](const std::wstring& value) {
+        if (value.empty() || value == key || variants.size() >= 8) return;
+        if (std::find(variants.begin(), variants.end(), value) == variants.end()) variants.push_back(value);
+    };
+    if (!key.empty()) {
+        if (key[0] == L'n') add(L"l" + key.substr(1));
+        if (key[0] == L'l') add(L"n" + key.substr(1));
+        if (key.rfind(L"ng", 0) == 0) add(key.substr(2)); else add(L"ng" + key);
+        if (key[0] == L'h') add(L"f" + key.substr(1));
+        if (key[0] == L'f') add(L"h" + key.substr(1));
+        if (key.size() > 2 && key.substr(key.size() - 2) == L"ng") add(key.substr(0, key.size() - 1));
+        else if (key.size() > 1 && key.back() == L'n') add(key + L"g");
+    }
+    for (size_t i = 0; i < key.size() && variants.size() < 8; ++i) add(key.substr(0, i) + key.substr(i + 1));
+    for (size_t i = 0; i + 1 < key.size() && variants.size() < 8; ++i) {
+        std::wstring swapped = key;
+        std::swap(swapped[i], swapped[i + 1]);
+        add(swapped);
+    }
+    return variants;
+}
+
+FuzzyCacheMatch FindFuzzyCachedCandidates(const std::wstring& composition) {
+    FuzzyCacheMatch match;
+    if (!gSettings.localFuzzySuggestions) return match;
+    std::vector<std::wstring> variants = LocalFuzzyVariants(composition);
+    std::vector<CandidateCacheEntry> entries = LoadCandidateCache();
+    for (const auto& variant : variants) {
+        for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+            if (it->input == variant) {
+                match.matchedInput = variant;
+                match.candidates = it->candidates;
+                return match;
+            }
+        }
+    }
+    return match;
 }
 
 void ClearCandidateCache() {
@@ -522,6 +640,13 @@ DWORD WINAPI CandidateThread(LPVOID parameter) {
         if (!cached.empty()) {
             result->candidates = PersonalizeCandidates(result->composition, cached);
             result->error = L"離線候選快取";
+        } else {
+            FuzzyCacheMatch fuzzy = FindFuzzyCachedCandidates(result->composition);
+            if (!fuzzy.candidates.empty()) {
+                result->candidates = PersonalizeCandidates(result->composition, fuzzy.candidates);
+                result->error = L"離線本機近音建議";
+                result->fuzzyHint = L"本機近音：" + fuzzy.matchedInput;
+            }
         }
     }
     if (!PostMessage(gMain, WM_CANDIDATES_READY, 0, reinterpret_cast<LPARAM>(result))) delete result;
@@ -563,7 +688,10 @@ std::wstring CandidateDisplayText() {
     std::wstring display = gEnglishMode ? L"EN　" : L"中　";
     display += IsSnippetComposition() ? L"短語：" + gComposition : L"粵語：" + gComposition;
     if (!gStatus.empty()) display += L"　" + gStatus;
-    if (!gFuzzyHint.empty()) display += L"　容錯讀音：" + gFuzzyHint;
+    if (!gFuzzyHint.empty()) {
+        if (gFuzzyHint.rfind(L"本機近音：", 0) == 0) display += L"　" + gFuzzyHint;
+        else display += L"　容錯讀音：" + gFuzzyHint;
+    }
     display += L"　[" + std::to_wstring(gCandidatePage + 1) + L"/" + std::to_wstring(PageCount()) + L"]\n";
     if (gCandidates.empty()) return display + L"搜尋中…";
     size_t start = CurrentPageStart();
@@ -691,6 +819,8 @@ void SelectCandidate(size_t index) {
     std::wstring input = gComposition;
     ClearComposition();
     RecordHistory(input, selected);
+    RecordContext(gLastCommittedWord, selected);
+    gLastCommittedWord = selected;
     PasteText(selected);
 }
 
@@ -897,14 +1027,16 @@ void ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING, 3, L"開啟常用短語");
     AppendMenuW(menu, MF_STRING, 4, L"開啟自訂詞庫");
     AppendMenuW(menu, MF_STRING, 5, L"開啟選字歷史");
-    AppendMenuW(menu, MF_STRING, 6, L"開啟離線候選快取");
-    AppendMenuW(menu, MF_STRING, 7, L"開啟設定檔");
+    AppendMenuW(menu, MF_STRING, 6, L"開啟語境歷史");
+    AppendMenuW(menu, MF_STRING, 7, L"開啟離線候選快取");
+    AppendMenuW(menu, MF_STRING, 8, L"開啟設定檔");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 8, L"清除本機選字歷史");
-    AppendMenuW(menu, MF_STRING, 9, L"清除離線候選快取");
-    AppendMenuW(menu, MF_STRING, 10, L"清除所有本機資料…");
+    AppendMenuW(menu, MF_STRING, 9, L"清除本機選字歷史");
+    AppendMenuW(menu, MF_STRING, 10, L"清除語境歷史");
+    AppendMenuW(menu, MF_STRING, 11, L"清除離線候選快取");
+    AppendMenuW(menu, MF_STRING, 12, L"清除所有本機資料…");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 11, L"結束程式");
+    AppendMenuW(menu, MF_STRING, 13, L"結束程式");
     SetForegroundWindow(gMain);
     int choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, point.x, point.y, 0, gMain, nullptr);
     DestroyMenu(menu);
@@ -913,17 +1045,19 @@ void ShowTrayMenu() {
     if (choice == 3) { EnsureSnippetsFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"snippets.tsv").c_str(), nullptr, SW_SHOWNORMAL); }
     if (choice == 4) { EnsureDictionaryFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"custom_dictionary.tsv").c_str(), nullptr, SW_SHOWNORMAL); }
     if (choice == 5) ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"history.tsv").c_str(), nullptr, SW_SHOWNORMAL);
-    if (choice == 6) ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"candidate_cache.tsv").c_str(), nullptr, SW_SHOWNORMAL);
-    if (choice == 7) { EnsureSettingsFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"settings.ini").c_str(), nullptr, SW_SHOWNORMAL); }
-    if (choice == 8) { ClearHistoryFile(); gStatus = L"已清除本機選字歷史"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
-    if (choice == 9) { ClearCandidateCache(); gStatus = L"已清除離線候選快取"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
-    if (choice == 10 && MessageBoxW(gMain, L"會清除短語、詞庫、歷史與離線候選快取。此操作無法復原，是否繼續？", L"CantoCandidate", MB_YESNO | MB_ICONWARNING) == IDYES) {
-        const wchar_t* files[] = {L"snippets.tsv", L"custom_dictionary.tsv", L"history.tsv", L"candidate_cache.tsv"};
+    if (choice == 6) ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"context_history.tsv").c_str(), nullptr, SW_SHOWNORMAL);
+    if (choice == 7) ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"candidate_cache.tsv").c_str(), nullptr, SW_SHOWNORMAL);
+    if (choice == 8) { EnsureSettingsFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"settings.ini").c_str(), nullptr, SW_SHOWNORMAL); }
+    if (choice == 9) { ClearHistoryFile(); gStatus = L"已清除本機選字歷史"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
+    if (choice == 10) { ClearContextHistory(); gStatus = L"已清除語境歷史"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
+    if (choice == 11) { ClearCandidateCache(); gStatus = L"已清除離線候選快取"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
+    if (choice == 12 && MessageBoxW(gMain, L"會清除短語、詞庫、選字歷史、語境歷史與離線候選快取。此操作無法復原，是否繼續？", L"CantoCandidate", MB_YESNO | MB_ICONWARNING) == IDYES) {
+        const wchar_t* files[] = {L"snippets.tsv", L"custom_dictionary.tsv", L"history.tsv", L"context_history.tsv", L"candidate_cache.tsv"};
         for (const wchar_t* file : files) { std::wstring path = DataFilePath(file); if (IsSafeDataPath(path)) DeleteFileW(path.c_str()); }
-        EnsureSnippetsFile(); EnsureDictionaryFile();
+        gLastCommittedWord.clear(); EnsureSnippetsFile(); EnsureDictionaryFile();
         gStatus = L"已清除本機資料"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr);
     }
-    if (choice == 11) PostMessage(gMain, WM_CLOSE, 0, 0);
+    if (choice == 13) PostMessage(gMain, WM_CLOSE, 0, 0);
 }
 
 LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
