@@ -1,0 +1,17 @@
+# Build and release outputs
+dist/
+release/
+*.exe
+*.zip
+CHECKSUMS-SHA256*.txt
+
+# Local personalisation data
+history.tsv
+
+# Local tools and secrets
+.github_publish_token
+*.token
+
+# Temporary files
+*.tmp
+*.log
