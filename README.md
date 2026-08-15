@@ -1,4 +1,4 @@
-# 粵語候選字工具（Windows 11 可攜版 v0.8）
+# 粵語候選字工具（Windows 11 可攜版 v0.8.1 Online）
 
 這是一個 **免安裝、單一執行檔** 的 Windows x64 粵語輸入輔助工具。它在使用者主動開啟中文模式後，將近似英文拼音送往 Google Input Tools 的粵語候選字服務，顯示多頁候選字，並把選取結果貼入目前的程式。它並非 Google 官方產品，亦不是 Windows 語言列內的原生 IME。
 
@@ -17,8 +17,8 @@
 | `Ctrl + Alt + G` | 開啟或關閉工具。開啟後預設為「中」模式。 |
 | 單獨按一下 `Shift` | 在「中」與「EN」之間切換。按住 Shift 配合其他按鍵時，仍是一般 Shift 行為。 |
 | `a`–`z`（中模式） | 輸入近似英文拼音，例如 `neihou`；輸入 `;shortcut` 後按空白鍵／Enter 可展開本機短語。 |
-| `1`–`9` | 直接選取目前頁面相應候選。 |
-| `Space` 或 `Enter` | 選取目前焦點所標示的候選。 |
+| 主鍵盤 `1`–`9` 或 NumPad `1`–`9` | 直接選取目前頁面相應候選。NumPad 只在候選顯示時攔截。 |
+| `Space`、主 `Enter` 或 NumPad `Enter` | 選取目前焦點所標示的候選。 |
 | `←`／`→` | 在目前頁面移動候選焦點。焦點以 `【…】` 標示。 |
 | `PageUp`／`PageDown`、`↑`／`↓`、`,`／`.`、`-`／`=` | 上一頁／下一頁候選。每頁最多 9 個。 |
 | `Backspace` | 刪除一個英文字母並重新搜尋。 |
@@ -67,6 +67,10 @@ m4goi	唔該
 工具採用與可攜式九方工具相近的「背景按鍵處理＋候選視窗」模式，而不是把自己安裝成 Windows TSF/IME。因此它可解壓直接使用，並在多數一般桌面 App 中貼字；不過 Windows 的安全隔離仍然生效。如果目標程式以「系統管理員身分執行」，本工具也須以相同權限啟動才能貼字。部分密碼欄、遊戲、防作弊程式和受保護輸入框會封鎖貼上，工具不會嘗試繞過這些保護。
 
 新拼音需要網絡才可取得 Google 候選字；但服務無回應時，程式會嘗試使用同資料夾 `candidate_cache.tsv` 的離線候選快取。容錯是 Google 候選服務的配對結果，並非保證任意錯拼都能找回原來字詞；錯得太遠時，最合理的另一個讀音可能會排到前面，因此請留意候選列而不要盲目按第一個。
+
+## v0.8.1 Online：NumPad 選字
+
+v0.8.1 保持 Google 線上候選、離線快取、本機近音與語境排序，並加入 NumPad `1`–`9`。候選窗顯示時，數字鍵盤與主鍵盤數字鍵都會選取目前頁面的相應候選；沒有候選時，NumPad 數字會交回原本程式正常輸入。NumPad Enter 沿用 Windows 的 `VK_RETURN`，會與主 Enter 一樣確認目前焦點。
 
 ## v0.8：本機近音建議與語境排序
 
@@ -118,10 +122,10 @@ v0.6 預設會嘗試把候選窗顯示在目前文字游標（caret）下方；�
 
 v0.5 已加入遠端回應 1 MiB 上限、組字長度 64 字元上限、120 ms 候選請求合併延遲、本機詞庫重新解析點防護、詞庫 1 MiB 上限，以及固定使用 Windows 系統目錄的記事本。完整結果見 `SECURITY_AUDIT_REPORT.md` 與 `SECURITY_AUDIT_SCOPE.md`。
 
-每次交付都附帶 SHA-256。請在 Windows 開啟 PowerShell 並執行以下命令，再與 `CHECKSUMS-SHA256-v0.8.txt` 比較：
+每次交付都附帶 SHA-256。請在 Windows 開啟 PowerShell 並執行以下命令，再與 `CHECKSUMS-SHA256-v0.8.1.txt` 比較：
 
 ```powershell
-Get-FileHash .\CantoCandidate-Win11-Portable-v0.8.zip -Algorithm SHA256
+Get-FileHash .\CantoCandidate-Win11-Portable-v0.8.1.zip -Algorithm SHA256
 ```
 
 解壓後亦建議以 Windows Defender 掃描 `CantoCandidate.exe`。程式未有商業程式碼簽章，只有在你信任來源並核對雜湊後才應執行。

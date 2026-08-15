@@ -1007,10 +1007,13 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         if (!gComposition.empty()) return 1;
         return CallNextHookEx(gHook, code, wParam, lParam);
     }
-    if (vk >= '1' && vk <= '9') {
+    const bool topRowDigit = vk >= '1' && vk <= '9';
+    const bool numpadDigit = vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9;
+    if (topRowDigit || numpadDigit) {
         if (!gCandidates.empty()) {
-            size_t index = CurrentPageStart() + static_cast<size_t>(vk - '1');
-            if (index < gCandidates.size() && static_cast<size_t>(vk - '1') < CurrentPageSize()) SelectCandidate(index);
+            size_t candidateOffset = topRowDigit ? static_cast<size_t>(vk - '1') : static_cast<size_t>(vk - VK_NUMPAD1);
+            size_t index = CurrentPageStart() + candidateOffset;
+            if (index < gCandidates.size() && candidateOffset < CurrentPageSize()) SelectCandidate(index);
             return 1;
         }
         if (!gComposition.empty()) return 1;
