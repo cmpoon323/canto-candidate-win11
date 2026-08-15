@@ -1,8 +1,8 @@
-# 粵語候選字工具（Windows 11 可攜版 v0.8）
+# 粵語候選字工具（Windows 11 可攜版 v0.9 Offline Core）
 
-這是一個 **免安裝、單一執行檔** 的 Windows x64 粵語輸入輔助工具。它在使用者主動開啟中文模式後，將近似英文拼音送往 Google Input Tools 的粵語候選字服務，顯示多頁候選字，並把選取結果貼入目前的程式。它並非 Google 官方產品，亦不是 Windows 語言列內的原生 IME。
+這是一個 **免安裝、可完全離線使用** 的 Windows x64 粵語輸入輔助工具。它在使用者主動開啟中文模式後，只查詢同一資料夾的本機 Rime-Cantonese 編譯詞庫，顯示多頁候選字，並把選取結果貼入目前的程式。v0.9 不建立候選網絡連線；它亦不是 Windows 語言列內的原生 IME。
 
-> **適合的使用情況：** 你想好似 USB 九方類工具咁，放喺手指或任何資料夾，雙擊即用，又希望使用 Google 粵語的近似拼音候選字、容錯配對與本機常用詞排序。
+> **適合的使用情況：** 你想好似 USB 九方類工具咁，放喺手指或任何資料夾，雙擊即用，又想在無網絡下使用粵拼候選、明示容錯規則與本機常用詞排序。
 
 ## 啟動方式
 
@@ -62,11 +62,19 @@ m4goi	唔該
 
 ## 運作、私隱與安全限制
 
-候選字請求會經加密連線送到 `inputtools.google.com`；程式只傳送你**在已開啟中文模式時**輸入的英文字母組合。程式不會建立雲端帳戶、上傳選字歷史或自訂詞庫，亦沒有廣告及沒有背景自動更新。由於拼音組合會傳送至 Google，請不要在密碼欄、網上銀行或其他敏感欄位開啟中文模式。
+v0.9 的候選引擎**不建立網絡連線**，不會傳送拼音、已選詞、短語、歷史、詞庫或語境資料。程式不會建立雲端帳戶、上傳資料、展示廣告或背景自動更新。`offline_lexicon.bin`、短語、詞庫、歷史、語境和設定均存於 EXE 同一資料夾，請把整個資料夾放在你信任的位置。
 
 工具採用與可攜式九方工具相近的「背景按鍵處理＋候選視窗」模式，而不是把自己安裝成 Windows TSF/IME。因此它可解壓直接使用，並在多數一般桌面 App 中貼字；不過 Windows 的安全隔離仍然生效。如果目標程式以「系統管理員身分執行」，本工具也須以相同權限啟動才能貼字。部分密碼欄、遊戲、防作弊程式和受保護輸入框會封鎖貼上，工具不會嘗試繞過這些保護。
 
-新拼音需要網絡才可取得 Google 候選字；但服務無回應時，程式會嘗試使用同資料夾 `candidate_cache.tsv` 的離線候選快取。容錯是 Google 候選服務的配對結果，並非保證任意錯拼都能找回原來字詞；錯得太遠時，最合理的另一個讀音可能會排到前面，因此請留意候選列而不要盲目按第一個。
+v0.9 的新拼音直接由 `offline_lexicon.bin` 查詢。候選詞庫包含 Rime-Cantonese 的直接字詞粵拼映射，並以其內建頻率資料排列；高頻多字詞只在能形成可用本機粵拼碼時有限推導。容錯只套用明示的本機規則，並非保證任意錯拼都能找回原詞；錯得太遠時請留意候選列而不要盲目按第一個。
+
+## v0.9 Offline Core：完全離線詞庫
+
+`offline_lexicon.bin` 是 v0.9 的必要檔案，必須保留於 EXE 同一資料夾。它由 Rime-Cantonese 的直接標音字表、詞表及頻率資料編譯，約有 16 萬個離線候選碼；程式啟動時會驗證格式、大小和排序，檔案損毀、被替換為重新解析點或遺失時會拒絕使用。
+
+候選窗會標示 `OFFLINE`。`n/l`、首音 `ng` 有／無、`h/f`、尾音 `ng/n`、單一字母刪除和相鄰交換等近音，只會在精確查詢沒有結果時使用，並顯示實際匹配碼。可以在 `settings.ini` 以 `local_fuzzy_suggestions=0` 完全關閉。
+
+本版本保留本機自訂詞、短語、選字歷史和語境排序；它們都不會離開可攜式資料夾。詞庫來源、資料處理、歸屬和完整授權見 `THIRD_PARTY_NOTICES.md` 及 `third_party/rime-cantonese/`。
 
 ## v0.8：本機近音建議與語境排序
 
@@ -116,19 +124,19 @@ v0.6 預設會嘗試把候選窗顯示在目前文字游標（caret）下方；�
 
 ## 安全修正版與完整性核對
 
-v0.5 已加入遠端回應 1 MiB 上限、組字長度 64 字元上限、120 ms 候選請求合併延遲、本機詞庫重新解析點防護、詞庫 1 MiB 上限，以及固定使用 Windows 系統目錄的記事本。完整結果見 `SECURITY_AUDIT_REPORT.md` 與 `SECURITY_AUDIT_SCOPE.md`。
+v0.5 起已加入組字長度 64 字元上限、本機詞庫重新解析點防護、詞庫 1 MiB 上限、固定使用 Windows 系統目錄的記事本，以及 ASLR／DEP 安全旗標。v0.9 另外將離線詞庫讀取限制為 32 MiB、最多 500,000 詞條，並拒絕不安全路徑、格式錯誤、未排序或截斷的索引。完整結果見 `SECURITY_AUDIT_REPORT.md`、`SECURITY_AUDIT_SCOPE.md` 與 `V0.9_SPEC.md`。
 
-每次交付都附帶 SHA-256。請在 Windows 開啟 PowerShell 並執行以下命令，再與 `CHECKSUMS-SHA256-v0.8.txt` 比較：
+每次交付都附帶 SHA-256。請在 Windows 開啟 PowerShell 並執行以下命令，再與 `CHECKSUMS-SHA256-v0.9.txt` 比較：
 
 ```powershell
-Get-FileHash .\CantoCandidate-Win11-Portable-v0.8.zip -Algorithm SHA256
+Get-FileHash .\CantoCandidate-Win11-Portable-v0.9.zip -Algorithm SHA256
 ```
 
 解壓後亦建議以 Windows Defender 掃描 `CantoCandidate.exe`。程式未有商業程式碼簽章，只有在你信任來源並核對雜湊後才應執行。
 
 ## 授權與來源
 
-程式源碼以 MIT License 提供，見 `LICENSE`。本專案只為互通測試而設，**不獲 Google 認可、贊助或支援**；「Google」與「Google Input Tools」為其各自權利人之商標。Google 官方網頁列明 Input Tools 可在 Chrome 和 Google 服務內使用；本工具使用的是其公開可達的候選字回應，並不代表取得官方 Windows IME 授權。[1]
+程式源碼以 MIT License 提供，見 `LICENSE`。本專案不獲 Rime、CanCLID 或其貢獻者認可、贊助或支援。v0.9 使用 Rime-Cantonese 資料的編譯產物，並不代表取得官方 Windows IME 授權；再發佈時必須保留 `THIRD_PARTY_NOTICES.md` 與附帶授權。
 
 ## 開發者建置
 
@@ -136,11 +144,11 @@ Get-FileHash .\CantoCandidate-Win11-Portable-v0.8.zip -Algorithm SHA256
 
 ```bash
 x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -mwindows -municode -static -static-libgcc -static-libstdc++ \
-  src/CantoCandidate.cpp -o dist/CantoCandidate.exe -lwinhttp -luser32 -lgdi32 -lshell32 -lole32
+  src/CantoCandidate.cpp -o dist/CantoCandidate.exe -luser32 -lgdi32 -lshell32 -lole32
 ```
 
-編譯產物是 Windows x64 GUI 程式，僅使用 Windows 11 內建的 `GDI32`、`KERNEL32`、`MSVCRT`、`OLE32`、`SHELL32`、`USER32`、`WINHTTP` DLL。
+編譯產物是 Windows x64 GUI 程式，僅使用 Windows 11 內建的 `GDI32`、`KERNEL32`、`MSVCRT`、`OLE32`、`SHELL32`、`USER32` DLL；v0.9 不匯入 `WINHTTP`。
 
 ## 參考資料
 
-[1] [Google Input Tools：Chrome 擴充功能與使用方式](https://www.google.com/inputtools/chrome/)
+[1] [Rime-Cantonese：授權與粵拼詞庫說明](https://github.com/rime/rime-cantonese/blob/main/README-en.md)

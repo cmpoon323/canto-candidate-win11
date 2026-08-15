@@ -1,11 +1,10 @@
 // CantoCandidate - portable Cantonese candidate input helper for Windows 11.
 // Not affiliated with, endorsed by, or supported by Google.
-// Build: x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -mwindows src/CantoCandidate.cpp -o dist/CantoCandidate.exe -lwinhttp -luser32 -lgdi32 -lshell32
+// Build: x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -mwindows src/CantoCandidate.cpp -o dist/CantoCandidate.exe -luser32 -lgdi32 -lshell32 -lole32
 
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
-#include <winhttp.h>
 #include <shellapi.h>
 #include <ole2.h>
 #include <string>
@@ -13,8 +12,9 @@
 #include <sstream>
 #include <algorithm>
 #include <cwctype>
+#include <cstdint>
+#include <cstring>
 
-#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
 
 constexpr UINT WM_CANDIDATES_READY = WM_APP + 1;
@@ -23,7 +23,8 @@ constexpr UINT TIMER_STATUS = 42;
 constexpr UINT TIMER_REQUEST = 43;
 constexpr UINT TIMER_CLIPBOARD_RESTORE = 44;
 constexpr size_t MAX_COMPOSITION_CHARS = 64;
-constexpr size_t MAX_RESPONSE_BYTES = 1024 * 1024;
+constexpr size_t MAX_OFFLINE_LEXICON_BYTES = 32 * 1024 * 1024;
+constexpr size_t MAX_OFFLINE_ENTRIES = 500000;
 constexpr int HOTKEY_ID = 100;
 constexpr UINT TRAY_ID = 1;
 constexpr size_t MAX_PAGE_SIZE = 9;
@@ -61,6 +62,15 @@ Settings gSettings;
 IDataObject* gClipboardBackup = nullptr;
 DWORD gClipboardSequenceAfterPaste = 0;
 std::wstring gLastCommittedWord;
+
+struct OfflineEntry {
+    std::string code;
+    std::wstring word;
+    std::wstring jyutping;
+};
+std::vector<OfflineEntry> gOfflineLexicon;
+bool gOfflineLexiconLoaded = false;
+std::wstring gOfflineLexiconError;
 
 void ResizeAndShowCandidate();
 void UpdateTrayIcon();
@@ -140,6 +150,56 @@ std::string ReadUtf8File(const std::wstring& path) {
     data.resize(read);
     if (data.size() >= 3 && static_cast<unsigned char>(data[0]) == 0xEF && static_cast<unsigned char>(data[1]) == 0xBB && static_cast<unsigned char>(data[2]) == 0xBF) data.erase(0, 3);
     return data;
+}
+
+bool LoadOfflineLexicon() {
+    gOfflineLexicon.clear();
+    gOfflineLexiconLoaded = false;
+    gOfflineLexiconError.clear();
+    const std::wstring path = DataFilePath(L"offline_lexicon.bin");
+    if (!IsSafeDataPath(path)) { gOfflineLexiconError = L"離線詞庫路徑不安全"; return false; }
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (file == INVALID_HANDLE_VALUE) { gOfflineLexiconError = L"找不到 offline_lexicon.bin"; return false; }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 16 || size.QuadPart > static_cast<LONGLONG>(MAX_OFFLINE_LEXICON_BYTES)) {
+        CloseHandle(file); gOfflineLexiconError = L"離線詞庫大小無效"; return false;
+    }
+    std::vector<unsigned char> bytes(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    bool readOk = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) && read == bytes.size();
+    CloseHandle(file);
+    if (!readOk) { gOfflineLexiconError = L"無法讀取離線詞庫"; return false; }
+    if (memcmp(bytes.data(), "CANTOLEX", 8) != 0) { gOfflineLexiconError = L"離線詞庫格式不正確"; return false; }
+    auto readU32 = [&](size_t offset) -> uint32_t { uint32_t value = 0; memcpy(&value, bytes.data() + offset, sizeof(value)); return value; };
+    const uint32_t version = readU32(8);
+    const uint32_t entries = readU32(12);
+    if (version != 2 || entries == 0 || entries > MAX_OFFLINE_ENTRIES) { gOfflineLexiconError = L"離線詞庫版本或詞條數無效"; return false; }
+    size_t offset = 16;
+    gOfflineLexicon.reserve(entries);
+    for (uint32_t i = 0; i < entries; ++i) {
+        if (offset + 10 > bytes.size()) { gOfflineLexiconError = L"離線詞庫詞條截斷"; gOfflineLexicon.clear(); return false; }
+        uint16_t codeLength = 0, wordLength = 0, jyutpingLength = 0;
+        uint32_t sourceWeight = 0;
+        memcpy(&codeLength, bytes.data() + offset, 2); memcpy(&wordLength, bytes.data() + offset + 2, 2); memcpy(&jyutpingLength, bytes.data() + offset + 4, 2); memcpy(&sourceWeight, bytes.data() + offset + 6, 4);
+        offset += 10;
+        const size_t payload = static_cast<size_t>(codeLength) + wordLength + jyutpingLength;
+        if (codeLength == 0 || wordLength == 0 || offset + payload > bytes.size()) { gOfflineLexiconError = L"離線詞庫詞條無效"; gOfflineLexicon.clear(); return false; }
+        std::string code(reinterpret_cast<const char*>(bytes.data() + offset), codeLength); offset += codeLength;
+        std::string word(reinterpret_cast<const char*>(bytes.data() + offset), wordLength); offset += wordLength;
+        std::string jyutping(reinterpret_cast<const char*>(bytes.data() + offset), jyutpingLength); offset += jyutpingLength;
+        std::wstring decodedWord = Utf8ToWide(word);
+        std::wstring decodedJyutping = Utf8ToWide(jyutping);
+        if (decodedWord.empty() || decodedJyutping.empty() || !std::all_of(code.begin(), code.end(), [](unsigned char c) { return c >= 'a' && c <= 'z'; })) {
+            gOfflineLexiconError = L"離線詞庫含無效資料"; gOfflineLexicon.clear(); return false;
+        }
+        (void)sourceWeight; // The compiled order already preserves source frequency priority.
+        gOfflineLexicon.push_back({code, decodedWord, decodedJyutping});
+    }
+    if (offset != bytes.size() || !std::is_sorted(gOfflineLexicon.begin(), gOfflineLexicon.end(), [](const OfflineEntry& a, const OfflineEntry& b) { return a.code < b.code; })) {
+        gOfflineLexiconError = L"離線詞庫排序無效"; gOfflineLexicon.clear(); return false;
+    }
+    gOfflineLexiconLoaded = true;
+    return true;
 }
 
 bool WriteUtf8File(const std::wstring& path, const std::string& data, DWORD creation = CREATE_ALWAYS) {
@@ -549,6 +609,49 @@ std::wstring CompactLower(const std::wstring& value) {
     return output;
 }
 
+std::string OfflineQueryCode(const std::wstring& composition) {
+    std::string utf8 = WideToUtf8(CompactLower(composition));
+    std::string code;
+    for (unsigned char ch : utf8) if (ch >= 'a' && ch <= 'z') code.push_back(static_cast<char>(ch));
+    return code;
+}
+
+std::vector<std::wstring> LookupOfflineCode(const std::wstring& composition) {
+    std::vector<std::wstring> words;
+    if (!gOfflineLexiconLoaded) return words;
+    const std::string code = OfflineQueryCode(composition);
+    if (code.empty()) return words;
+    auto it = std::lower_bound(gOfflineLexicon.begin(), gOfflineLexicon.end(), code, [](const OfflineEntry& entry, const std::string& value) { return entry.code < value; });
+    while (it != gOfflineLexicon.end() && it->code == code && words.size() < 45) {
+        if (std::find(words.begin(), words.end(), it->word) == words.end()) words.push_back(it->word);
+        ++it;
+    }
+    return words;
+}
+
+bool LookupOfflineCandidates(const std::wstring& composition, CandidateResult& result) {
+    if (!gOfflineLexiconLoaded) { result.error = gOfflineLexiconError.empty() ? L"離線詞庫未載入" : gOfflineLexiconError; return false; }
+    std::vector<std::wstring> exact = LookupOfflineCode(composition);
+    if (!exact.empty()) {
+        result.candidates = PersonalizeCandidates(composition, exact);
+        result.error = L"OFFLINE";
+        return !result.candidates.empty();
+    }
+    if (gSettings.localFuzzySuggestions) {
+        for (const std::wstring& variant : LocalFuzzyVariants(composition)) {
+            std::vector<std::wstring> fuzzy = LookupOfflineCode(variant);
+            if (!fuzzy.empty()) {
+                result.candidates = PersonalizeCandidates(composition, fuzzy);
+                result.error = L"OFFLINE 本機近音建議";
+                result.fuzzyHint = L"本機近音：" + CompactLower(variant);
+                return !result.candidates.empty();
+            }
+        }
+    }
+    result.error = L"OFFLINE：找不到候選字";
+    return false;
+}
+
 std::wstring ParseFirstAnnotation(const std::string& response) {
     const std::string marker = "\"annotation\":[";
     size_t position = response.find(marker);
@@ -576,79 +679,12 @@ std::vector<std::wstring> ParseCandidates(const std::string& response, const std
     return values;
 }
 
-bool DownloadCandidates(const std::wstring& composition, CandidateResult& result) {
-    std::string targetUtf8 = "/request?text=" + UrlEncodeAscii(composition) +
-        "&itc=yue-hant-t-i0-und&num=45&cp=0&cs=1&ie=utf-8&oe=utf-8";
-    std::wstring target = Utf8ToWide(targetUtf8);
-    HINTERNET session = WinHttpOpen(L"CantoCandidate/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) { result.error = L"無法建立網絡連線"; return false; }
-    WinHttpSetTimeouts(session, 3000, 3000, 4000, 4000);
-    HINTERNET connection = WinHttpConnect(session, L"inputtools.google.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!connection) { WinHttpCloseHandle(session); result.error = L"無法連接候選字服務"; return false; }
-    HINTERNET request = WinHttpOpenRequest(connection, L"GET", target.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (!request) {
-        WinHttpCloseHandle(connection); WinHttpCloseHandle(session);
-        result.error = L"無法建立候選字請求"; return false;
-    }
-    bool sent = WinHttpSendRequest(request, L"Accept: application/json\r\n", -1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(request, nullptr);
-    if (!sent) {
-        WinHttpCloseHandle(request); WinHttpCloseHandle(connection); WinHttpCloseHandle(session);
-        result.error = L"候選字服務沒有回應"; return false;
-    }
-    std::string body;
-    DWORD available = 0;
-    while (WinHttpQueryDataAvailable(request, &available) && available > 0) {
-        if (available > MAX_RESPONSE_BYTES || body.size() > MAX_RESPONSE_BYTES - available) {
-            WinHttpCloseHandle(request); WinHttpCloseHandle(connection); WinHttpCloseHandle(session);
-            result.error = L"候選字服務回應過大"; return false;
-        }
-        std::vector<char> buffer(available + 1, 0);
-        DWORD read = 0;
-        if (!WinHttpReadData(request, buffer.data(), available, &read)) break;
-        body.append(buffer.data(), read);
-        available = 0;
-    }
-    WinHttpCloseHandle(request); WinHttpCloseHandle(connection); WinHttpCloseHandle(session);
-    if (body.find("SUCCESS") == std::string::npos) {
-        result.error = L"候選字服務傳回無效資料"; return false;
-    }
-    std::vector<std::wstring> remoteCandidates = ParseCandidates(body, composition);
-    if (remoteCandidates.empty()) {
-        result.error = L"找不到候選字";
-        return false;
-    }
-    StoreCandidateCache(composition, remoteCandidates);
-    result.candidates = PersonalizeCandidates(composition, remoteCandidates);
-    std::wstring firstAnnotation = ParseFirstAnnotation(body);
-    if (!firstAnnotation.empty() && CompactLower(firstAnnotation) != CompactLower(composition)) {
-        result.fuzzyHint = firstAnnotation;
-    }
-        if (result.candidates.empty()) {
-        result.error = L"找不到候選字";
-        return false;
-    }
-    return true;
-}
-
 DWORD WINAPI CandidateThread(LPVOID parameter) {
     std::wstring* input = static_cast<std::wstring*>(parameter);
     CandidateResult* result = new CandidateResult();
     result->composition = *input;
     delete input;
-    if (!DownloadCandidates(result->composition, *result)) {
-        std::vector<std::wstring> cached = FindCachedCandidates(result->composition);
-        if (!cached.empty()) {
-            result->candidates = PersonalizeCandidates(result->composition, cached);
-            result->error = L"離線候選快取";
-        } else {
-            FuzzyCacheMatch fuzzy = FindFuzzyCachedCandidates(result->composition);
-            if (!fuzzy.candidates.empty()) {
-                result->candidates = PersonalizeCandidates(result->composition, fuzzy.candidates);
-                result->error = L"離線本機近音建議";
-                result->fuzzyHint = L"本機近音：" + fuzzy.matchedInput;
-            }
-        }
-    }
+    LookupOfflineCandidates(result->composition, *result);
     if (!PostMessage(gMain, WM_CANDIDATES_READY, 0, reinterpret_cast<LPARAM>(result))) delete result;
     return 0;
 }
@@ -840,9 +876,13 @@ void UpdateTrayIcon() {
 void ToggleInput() {
     gEnabled = !gEnabled;
     ClearComposition();
-    gStatus = gEnabled ? (gEnglishMode ? L"EN　英文直接輸入" : L"中　粵語拼音輸入") : L"粵語候選字：已關閉";
+    if (gEnabled && !gOfflineLexiconLoaded) {
+        gStatus = L"離線詞庫無法載入：" + gOfflineLexiconError;
+    } else {
+        gStatus = gEnabled ? (gEnglishMode ? L"EN　英文直接輸入" : L"中　離線粵語拼音") : L"粵語候選字：已關閉";
+    }
     ResizeAndShowCandidate();
-    SetTimer(gMain, TIMER_STATUS, 1200, nullptr);
+    SetTimer(gMain, TIMER_STATUS, 1600, nullptr);
     UpdateTrayIcon();
 }
 
@@ -1125,6 +1165,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     EnsureDictionaryFile();
     EnsureSnippetsFile();
     LoadSettings();
+    LoadOfflineLexicon();
     gMain = CreateWindowExW(0, mainClass, L"CantoCandidate", WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
     gCandidateWindow = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, candidateClass, L"", WS_POPUP, 0, 0, 0, 0, gMain, nullptr, instance, nullptr);
     RegisterHotKey(gMain, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G');

@@ -38,11 +38,15 @@ jobs:
             -static -static-libgcc -static-libstdc++ \
             -Wl,--dynamicbase,--nxcompat,--high-entropy-va \
             src/CantoCandidate.cpp -o dist/CantoCandidate.exe \
-            -lwinhttp -luser32 -lgdi32 -lshell32 -lole32
-          cp dist/CantoCandidate.exe README.md LICENSE CHANGELOG.md TESTING.md \
+            -luser32 -lgdi32 -lshell32 -lole32
+          python3 tools/build_offline_lexicon.py \
+            --source third_party/rime-cantonese/source \
+            --output data/offline_lexicon.bin \
+            --report build/OFFLINE_LEXICON_BUILD.json
+          cp dist/CantoCandidate.exe data/offline_lexicon.bin README.md LICENSE CHANGELOG.md TESTING.md \
             SECURITY_AUDIT_REPORT.md SECURITY_AUDIT_SCOPE.md ADVANCED_FEATURES_SPEC.md \
-            V0.6_SPEC.md V0.7_SPEC.md V0.8_SPEC.md WINDOWS11_TEST_CHECKLIST.md custom_dictionary.tsv snippets.tsv settings.ini package/CantoCandidate-Win11-Portable/
-          cp -r src research package/CantoCandidate-Win11-Portable/
+            THIRD_PARTY_NOTICES.md V0.6_SPEC.md V0.7_SPEC.md V0.8_SPEC.md V0.9_SPEC.md WINDOWS11_TEST_CHECKLIST.md custom_dictionary.tsv snippets.tsv settings.ini package/CantoCandidate-Win11-Portable/
+          cp -r src tools research third_party package/CantoCandidate-Win11-Portable/
           cd package
           zip -qr CantoCandidate-Win11-Portable.zip CantoCandidate-Win11-Portable
           sha256sum CantoCandidate-Win11-Portable.zip CantoCandidate-Win11-Portable/CantoCandidate.exe > CHECKSUMS-SHA256.txt
