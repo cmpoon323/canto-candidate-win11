@@ -1,4 +1,4 @@
-# 粵語候選字工具（Windows 11 可攜版 v0.6）
+# 粵語候選字工具（Windows 11 可攜版 v0.7）
 
 這是一個 **免安裝、單一執行檔** 的 Windows x64 粵語輸入輔助工具。它在使用者主動開啟中文模式後，將近似英文拼音送往 Google Input Tools 的粵語候選字服務，顯示多頁候選字，並把選取結果貼入目前的程式。它並非 Google 官方產品，亦不是 Windows 語言列內的原生 IME。
 
@@ -16,7 +16,7 @@
 |---|---|
 | `Ctrl + Alt + G` | 開啟或關閉工具。開啟後預設為「中」模式。 |
 | 單獨按一下 `Shift` | 在「中」與「EN」之間切換。按住 Shift 配合其他按鍵時，仍是一般 Shift 行為。 |
-| `a`–`z`（中模式） | 輸入近似英文拼音，例如 `neihou`。 |
+| `a`–`z`（中模式） | 輸入近似英文拼音，例如 `neihou`；輸入 `;shortcut` 後按空白鍵／Enter 可展開本機短語。 |
 | `1`–`9` | 直接選取目前頁面相應候選。 |
 | `Space` 或 `Enter` | 選取目前焦點所標示的候選。 |
 | `←`／`→` | 在目前頁面移動候選焦點。焦點以 `【…】` 標示。 |
@@ -66,7 +66,22 @@ m4goi	唔該
 
 工具採用與可攜式九方工具相近的「背景按鍵處理＋候選視窗」模式，而不是把自己安裝成 Windows TSF/IME。因此它可解壓直接使用，並在多數一般桌面 App 中貼字；不過 Windows 的安全隔離仍然生效。如果目標程式以「系統管理員身分執行」，本工具也須以相同權限啟動才能貼字。部分密碼欄、遊戲、防作弊程式和受保護輸入框會封鎖貼上，工具不會嘗試繞過這些保護。
 
-本版本需要網絡才可取得新的 Google 候選字。容錯是 Google 候選服務的配對結果，並非保證任意錯拼都能找回原來字詞；錯得太遠時，最合理的另一個讀音可能會排到前面，因此請留意候選列而不要盲目按第一個。
+新拼音需要網絡才可取得 Google 候選字；但服務無回應時，程式會嘗試使用同資料夾 `candidate_cache.tsv` 的離線候選快取。容錯是 Google 候選服務的配對結果，並非保證任意錯拼都能找回原來字詞；錯得太遠時，最合理的另一個讀音可能會排到前面，因此請留意候選列而不要盲目按第一個。
+
+## v0.7：常用短語、離線候選與資料管理
+
+短語定義在 `snippets.tsv`：輸入 `;addr`、`;email` 或 `;thanks`，再按 `Space` 或 `Enter`，即會展開本機定義的文字；短語不會送到候選服務。可右擊系統匣圖示選「開啟常用短語」直接編輯 TSV。
+
+Google 候選服務成功回應後，程式會保存該拼音和最多 45 個候選。日後斷網或服務無回應時，程式才會使用快取，並於候選窗標示「離線候選快取」。快取最多保存 2,000 組，可於系統匣選單單獨清除。
+
+右擊系統匣圖示可開啟短語、詞庫、歷史、快取及設定，也可清除全部本機資料；清除前會再次確認。這些檔案可能含你的自訂文字或拼音，請只把解壓資料夾放於受信任的位置。
+
+| 新設定 | 預設值 | 說明 |
+|---|---:|---|
+| `dark_mode` | `1` | `1` 為深色候選窗，`0` 為淺色候選窗。 |
+| `candidate_font_size` | `22` | 候選窗字體大小，支援 `16`–`32`。 |
+| `candidate_page_size` | `9` | 每頁候選數，支援 `5`–`9`。 |
+| `snippet_prefix` | `;` | 短語觸發字首；僅接受單一 ASCII 非空白字元。 |
 
 ## v0.6：候選窗定位、剪貼簿保留與設定
 
@@ -88,10 +103,10 @@ v0.6 預設會嘗試把候選窗顯示在目前文字游標（caret）下方；�
 
 v0.5 已加入遠端回應 1 MiB 上限、組字長度 64 字元上限、120 ms 候選請求合併延遲、本機詞庫重新解析點防護、詞庫 1 MiB 上限，以及固定使用 Windows 系統目錄的記事本。完整結果見 `SECURITY_AUDIT_REPORT.md` 與 `SECURITY_AUDIT_SCOPE.md`。
 
-每次交付都附帶 SHA-256。請在 Windows 開啟 PowerShell 並執行以下命令，再與 `CHECKSUMS-SHA256-v0.6.txt` 比較：
+每次交付都附帶 SHA-256。請在 Windows 開啟 PowerShell 並執行以下命令，再與 `CHECKSUMS-SHA256-v0.7.txt` 比較：
 
 ```powershell
-Get-FileHash .\CantoCandidate-Win11-Portable-v0.6.zip -Algorithm SHA256
+Get-FileHash .\CantoCandidate-Win11-Portable-v0.7.zip -Algorithm SHA256
 ```
 
 解壓後亦建議以 Windows Defender 掃描 `CantoCandidate.exe`。程式未有商業程式碼簽章，只有在你信任來源並核對雜湊後才應執行。
@@ -109,7 +124,7 @@ x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -mwindows -municode -static -static-lib
   src/CantoCandidate.cpp -o dist/CantoCandidate.exe -lwinhttp -luser32 -lgdi32 -lshell32 -lole32
 ```
 
-編譯產物是 Windows x64 GUI 程式，僅使用 Windows 11 內建的 `GDI32`、`KERNEL32`、`MSVCRT`、`SHELL32`、`USER32`、`WINHTTP` DLL。
+編譯產物是 Windows x64 GUI 程式，僅使用 Windows 11 內建的 `GDI32`、`KERNEL32`、`MSVCRT`、`OLE32`、`SHELL32`、`USER32`、`WINHTTP` DLL。
 
 ## 參考資料
 

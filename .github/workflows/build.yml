@@ -41,7 +41,7 @@ jobs:
             -lwinhttp -luser32 -lgdi32 -lshell32 -lole32
           cp dist/CantoCandidate.exe README.md LICENSE CHANGELOG.md TESTING.md \
             SECURITY_AUDIT_REPORT.md SECURITY_AUDIT_SCOPE.md ADVANCED_FEATURES_SPEC.md \
-            V0.6_SPEC.md custom_dictionary.tsv settings.ini package/CantoCandidate-Win11-Portable/
+            V0.6_SPEC.md V0.7_SPEC.md WINDOWS11_TEST_CHECKLIST.md custom_dictionary.tsv snippets.tsv settings.ini package/CantoCandidate-Win11-Portable/
           cp -r src research package/CantoCandidate-Win11-Portable/
           cd package
           zip -qr CantoCandidate-Win11-Portable.zip CantoCandidate-Win11-Portable

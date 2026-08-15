@@ -7,6 +7,7 @@ CHECKSUMS-SHA256*.txt
 
 # Local personalisation data
 history.tsv
+candidate_cache.tsv
 
 # Local tools and secrets
 .github_publish_token

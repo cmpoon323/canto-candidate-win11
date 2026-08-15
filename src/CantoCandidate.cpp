@@ -26,7 +26,8 @@ constexpr size_t MAX_COMPOSITION_CHARS = 64;
 constexpr size_t MAX_RESPONSE_BYTES = 1024 * 1024;
 constexpr int HOTKEY_ID = 100;
 constexpr UINT TRAY_ID = 1;
-constexpr size_t PAGE_SIZE = 9;
+constexpr size_t MAX_PAGE_SIZE = 9;
+constexpr size_t MAX_CANDIDATE_CACHE_ITEMS = 2000;
 
 HWND gMain = nullptr;
 HWND gCandidateWindow = nullptr;
@@ -49,6 +50,10 @@ struct Settings {
     bool followCaret = true;
     bool preserveClipboard = true;
     bool singleShiftToggle = true;
+    bool darkMode = true;
+    int candidateFontSize = 22;
+    int candidatePageSize = 9;
+    wchar_t snippetPrefix = L';';
 };
 Settings gSettings;
 IDataObject* gClipboardBackup = nullptr;
@@ -56,6 +61,7 @@ DWORD gClipboardSequenceAfterPaste = 0;
 
 void ResizeAndShowCandidate();
 void UpdateTrayIcon();
+bool IsSnippetComposition();
 
 struct CandidateResult {
     std::wstring composition;
@@ -160,8 +166,28 @@ bool ReadSettingValue(const std::wstring& data, const std::wstring& key, bool fa
     return fallback;
 }
 
+std::wstring ReadSettingText(const std::wstring& data, const std::wstring& key) {
+    std::wstringstream lines(data);
+    std::wstring line;
+    while (std::getline(lines, line)) {
+        if (line.empty() || line[0] == L'#' || line[0] == L';') continue;
+        size_t equals = line.find(L'=');
+        if (equals != std::wstring::npos && line.substr(0, equals) == key) return line.substr(equals + 1);
+    }
+    return L"";
+}
+
+int ReadSettingInteger(const std::wstring& data, const std::wstring& key, int fallback, int minimum, int maximum) {
+    try {
+        std::wstring value = ReadSettingText(data, key);
+        if (value.empty()) return fallback;
+        int parsed = std::stoi(value);
+        return parsed >= minimum && parsed <= maximum ? parsed : fallback;
+    } catch (...) { return fallback; }
+}
+
 void EnsureSettingsFile() {
-    const std::string starter = "; CantoCandidate settings (0=off, 1=on)\nfollow_caret=1\npreserve_clipboard=1\nsingle_shift_toggle=1\n";
+    const std::string starter = "; CantoCandidate settings (0=off, 1=on)\n; Restart CantoCandidate after changing this file.\nfollow_caret=1\npreserve_clipboard=1\nsingle_shift_toggle=1\ndark_mode=1\ncandidate_font_size=22\ncandidate_page_size=9\nsnippet_prefix=;\n";
     WriteUtf8File(DataFilePath(L"settings.ini"), starter, CREATE_NEW);
 }
 
@@ -172,6 +198,11 @@ void LoadSettings() {
     gSettings.followCaret = ReadSettingValue(data, L"follow_caret", true);
     gSettings.preserveClipboard = ReadSettingValue(data, L"preserve_clipboard", true);
     gSettings.singleShiftToggle = ReadSettingValue(data, L"single_shift_toggle", true);
+    gSettings.darkMode = ReadSettingValue(data, L"dark_mode", true);
+    gSettings.candidateFontSize = ReadSettingInteger(data, L"candidate_font_size", 22, 16, 32);
+    gSettings.candidatePageSize = ReadSettingInteger(data, L"candidate_page_size", 9, 5, static_cast<int>(MAX_PAGE_SIZE));
+    std::wstring prefix = ReadSettingText(data, L"snippet_prefix");
+    if (prefix.size() == 1 && !iswspace(prefix[0]) && prefix[0] < 128) gSettings.snippetPrefix = prefix[0];
 }
 
 struct HistoryEntry {
@@ -256,6 +287,88 @@ void EnsureDictionaryFile() {
 
 void ClearHistoryFile() {
     std::wstring path = DataFilePath(L"history.tsv");
+    if (IsSafeDataPath(path)) DeleteFileW(path.c_str());
+}
+
+void EnsureSnippetsFile() {
+    const std::string starter = "# CantoCandidate snippets (UTF-8)\n# Format: shortcut<TAB>text; use ;shortcut then Space or Enter\naddr\t香港九龍\nemail\tname@example.com\nthanks\t唔該晒！\n";
+    WriteUtf8File(DataFilePath(L"snippets.tsv"), starter, CREATE_NEW);
+}
+
+std::wstring FindSnippet(const std::wstring& shortcut) {
+    std::wstring data = Utf8ToWide(ReadUtf8File(DataFilePath(L"snippets.tsv")));
+    std::wstringstream lines(data);
+    std::wstring line;
+    std::wstring key = CompactLower(shortcut);
+    while (std::getline(lines, line)) {
+        if (line.empty() || line[0] == L'#') continue;
+        size_t tab = line.find(L'\t');
+        if (tab == std::wstring::npos) continue;
+        if (CompactLower(line.substr(0, tab)) == key) return line.substr(tab + 1);
+    }
+    return L"";
+}
+
+struct CandidateCacheEntry {
+    std::wstring input;
+    std::vector<std::wstring> candidates;
+};
+
+std::vector<CandidateCacheEntry> LoadCandidateCache() {
+    std::vector<CandidateCacheEntry> entries;
+    std::wstring data = Utf8ToWide(ReadUtf8File(DataFilePath(L"candidate_cache.tsv")));
+    std::wstringstream lines(data);
+    std::wstring line;
+    while (std::getline(lines, line)) {
+        size_t tab = line.find(L'\t');
+        if (tab == std::wstring::npos) continue;
+        CandidateCacheEntry entry{CompactLower(line.substr(0, tab)), {}};
+        std::wstring values = line.substr(tab + 1);
+        size_t start = 0;
+        while (start <= values.size() && entry.candidates.size() < 45) {
+            size_t separator = values.find(L'|', start);
+            std::wstring value = values.substr(start, separator == std::wstring::npos ? std::wstring::npos : separator - start);
+            if (!value.empty()) entry.candidates.push_back(value);
+            if (separator == std::wstring::npos) break;
+            start = separator + 1;
+        }
+        if (!entry.input.empty() && !entry.candidates.empty()) entries.push_back(entry);
+    }
+    return entries;
+}
+
+void SaveCandidateCache(const std::vector<CandidateCacheEntry>& entries) {
+    std::wstring data;
+    size_t start = entries.size() > MAX_CANDIDATE_CACHE_ITEMS ? entries.size() - MAX_CANDIDATE_CACHE_ITEMS : 0;
+    for (size_t i = start; i < entries.size(); ++i) {
+        data += entries[i].input + L"\t";
+        for (size_t j = 0; j < entries[i].candidates.size(); ++j) {
+            if (j) data += L"|";
+            data += entries[i].candidates[j];
+        }
+        data += L"\n";
+    }
+    WriteUtf8File(DataFilePath(L"candidate_cache.tsv"), WideToUtf8(data));
+}
+
+void StoreCandidateCache(const std::wstring& composition, const std::vector<std::wstring>& candidates) {
+    if (composition.empty() || candidates.empty()) return;
+    std::vector<CandidateCacheEntry> entries = LoadCandidateCache();
+    std::wstring key = CompactLower(composition);
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const CandidateCacheEntry& entry) { return entry.input == key; }), entries.end());
+    entries.push_back({key, candidates});
+    SaveCandidateCache(entries);
+}
+
+std::vector<std::wstring> FindCachedCandidates(const std::wstring& composition) {
+    std::wstring key = CompactLower(composition);
+    std::vector<CandidateCacheEntry> entries = LoadCandidateCache();
+    for (auto it = entries.rbegin(); it != entries.rend(); ++it) if (it->input == key) return it->candidates;
+    return {};
+}
+
+void ClearCandidateCache() {
+    std::wstring path = DataFilePath(L"candidate_cache.tsv");
     if (IsSafeDataPath(path)) DeleteFileW(path.c_str());
 }
 
@@ -381,13 +494,20 @@ bool DownloadCandidates(const std::wstring& composition, CandidateResult& result
     if (body.find("SUCCESS") == std::string::npos) {
         result.error = L"候選字服務傳回無效資料"; return false;
     }
-    result.candidates = PersonalizeCandidates(composition, ParseCandidates(body, composition));
+    std::vector<std::wstring> remoteCandidates = ParseCandidates(body, composition);
+    if (remoteCandidates.empty()) {
+        result.error = L"找不到候選字";
+        return false;
+    }
+    StoreCandidateCache(composition, remoteCandidates);
+    result.candidates = PersonalizeCandidates(composition, remoteCandidates);
     std::wstring firstAnnotation = ParseFirstAnnotation(body);
     if (!firstAnnotation.empty() && CompactLower(firstAnnotation) != CompactLower(composition)) {
         result.fuzzyHint = firstAnnotation;
     }
-    if (result.candidates.empty()) {
-        result.error = L"找不到候選字"; return false;
+        if (result.candidates.empty()) {
+        result.error = L"找不到候選字";
+        return false;
     }
     return true;
 }
@@ -397,7 +517,13 @@ DWORD WINAPI CandidateThread(LPVOID parameter) {
     CandidateResult* result = new CandidateResult();
     result->composition = *input;
     delete input;
-    DownloadCandidates(result->composition, *result);
+    if (!DownloadCandidates(result->composition, *result)) {
+        std::vector<std::wstring> cached = FindCachedCandidates(result->composition);
+        if (!cached.empty()) {
+            result->candidates = PersonalizeCandidates(result->composition, cached);
+            result->error = L"離線候選快取";
+        }
+    }
     if (!PostMessage(gMain, WM_CANDIDATES_READY, 0, reinterpret_cast<LPARAM>(result))) delete result;
     return 0;
 }
@@ -419,23 +545,24 @@ void RequestCandidates() {
 }
 
 size_t PageCount() {
-    return gCandidates.empty() ? 1 : (gCandidates.size() + PAGE_SIZE - 1) / PAGE_SIZE;
+    return gCandidates.empty() ? 1 : (gCandidates.size() + static_cast<size_t>(gSettings.candidatePageSize) - 1) / static_cast<size_t>(gSettings.candidatePageSize);
 }
 
 size_t CurrentPageStart() {
-    return gCandidatePage * PAGE_SIZE;
+    return gCandidatePage * static_cast<size_t>(gSettings.candidatePageSize);
 }
 
 size_t CurrentPageSize() {
     size_t start = CurrentPageStart();
-    return start < gCandidates.size() ? std::min(PAGE_SIZE, gCandidates.size() - start) : 0;
+    return start < gCandidates.size() ? std::min(static_cast<size_t>(gSettings.candidatePageSize), gCandidates.size() - start) : 0;
 }
 
 std::wstring CandidateDisplayText() {
-    if (!gStatus.empty()) return gStatus;
+    if (!gStatus.empty() && gCandidates.empty()) return gStatus;
     if (gComposition.empty()) return L"";
     std::wstring display = gEnglishMode ? L"EN　" : L"中　";
-    display += L"粵語：" + gComposition;
+    display += IsSnippetComposition() ? L"短語：" + gComposition : L"粵語：" + gComposition;
+    if (!gStatus.empty()) display += L"　" + gStatus;
     if (!gFuzzyHint.empty()) display += L"　容錯讀音：" + gFuzzyHint;
     display += L"　[" + std::to_wstring(gCandidatePage + 1) + L"/" + std::to_wstring(PageCount()) + L"]\n";
     if (gCandidates.empty()) return display + L"搜尋中…";
@@ -471,7 +598,7 @@ void ResizeAndShowCandidate() {
     POINT point{};
     if (!gSettings.followCaret || !TryGetCaretAnchor(point)) GetCursorPos(&point);
     int width = 820;
-    int height = 82;
+    int height = std::max(82, gSettings.candidateFontSize * 3 + 20);
     int x = std::max(4L, point.x - 20L);
     int y = point.y + 24;
     RECT work{};
@@ -542,6 +669,22 @@ void PasteText(const std::wstring& text) {
     }
 }
 
+bool IsSnippetComposition() {
+    return !gComposition.empty() && gComposition[0] == gSettings.snippetPrefix;
+}
+
+bool ExpandSnippetComposition() {
+    if (!IsSnippetComposition() || gComposition.size() <= 1) return false;
+    std::wstring snippet = FindSnippet(gComposition.substr(1));
+    if (snippet.empty()) return false;
+    ClearComposition();
+    PasteText(snippet);
+    gStatus = L"已展開短語";
+    ResizeAndShowCandidate();
+    SetTimer(gMain, TIMER_STATUS, 1000, nullptr);
+    return true;
+}
+
 void SelectCandidate(size_t index) {
     if (index >= gCandidates.size()) return;
     std::wstring selected = gCandidates[index];
@@ -578,13 +721,15 @@ LRESULT CALLBACK CandidateWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPA
         PAINTSTRUCT paint{};
         HDC hdc = BeginPaint(hwnd, &paint);
         RECT rect{}; GetClientRect(hwnd, &rect);
-        HBRUSH background = CreateSolidBrush(RGB(31, 41, 55));
+        COLORREF backgroundColor = gSettings.darkMode ? RGB(31, 41, 55) : RGB(255, 255, 255);
+        COLORREF textColor = gSettings.darkMode ? RGB(248, 250, 252) : RGB(17, 24, 39);
+        HBRUSH background = CreateSolidBrush(backgroundColor);
         FillRect(hdc, &rect, background);
         DeleteObject(background);
-        HFONT font = CreateFontW(-22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft JhengHei UI");
+        HFONT font = CreateFontW(-gSettings.candidateFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft JhengHei UI");
         HGDIOBJ previous = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(248, 250, 252));
+        SetTextColor(hdc, textColor);
         std::wstring display = CandidateDisplayText();
         RECT textRect{16, 9, rect.right - 16, rect.bottom - 8};
         DrawTextW(hdc, display.c_str(), static_cast<int>(display.size()), &textRect, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
@@ -675,6 +820,13 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         if (vk == VK_RIGHT) { MoveCandidateFocus(1); return 1; }
     }
     bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    if (vk == VK_OEM_1 && !shift && gSettings.snippetPrefix == L';' && gComposition.empty()) {
+        gComposition.push_back(gSettings.snippetPrefix);
+        gCandidates.clear();
+        gStatus.clear();
+        ResizeAndShowCandidate();
+        return 1;
+    }
     std::wstring punctuation = ChinesePunctuation(vk, shift);
     if (!punctuation.empty()) {
         if (!gComposition.empty()) ClearComposition();
@@ -694,7 +846,7 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         gCandidatePage = 0;
         gCandidateFocus = 0;
         ResizeAndShowCandidate();
-        RequestCandidates();
+        if (!IsSnippetComposition()) RequestCandidates();
         return 1;
     }
     if (vk == VK_BACK) {
@@ -713,6 +865,14 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         return CallNextHookEx(gHook, code, wParam, lParam);
     }
     if (vk == VK_SPACE || vk == VK_RETURN) {
+        if (IsSnippetComposition()) {
+            if (!ExpandSnippetComposition()) {
+                gStatus = L"找不到短語；可右擊系統匣開啟 snippets.tsv";
+                ResizeAndShowCandidate();
+                SetTimer(gMain, TIMER_STATUS, 1800, nullptr);
+            }
+            return 1;
+        }
         if (!gCandidates.empty()) { SelectCandidate(CurrentPageStart() + gCandidateFocus); return 1; }
         if (!gComposition.empty()) return 1;
         return CallNextHookEx(gHook, code, wParam, lParam);
@@ -734,20 +894,36 @@ void ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING, 1, gEnabled ? L"關閉粵語輸入" : L"開啟粵語輸入");
     AppendMenuW(menu, MF_STRING, 2, gEnglishMode ? L"切換至中文模式（Shift）" : L"切換至英文模式（Shift）");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 3, L"開啟自訂詞庫");
-    AppendMenuW(menu, MF_STRING, 4, L"開啟設定檔");
-    AppendMenuW(menu, MF_STRING, 5, L"清除本機選字歷史");
+    AppendMenuW(menu, MF_STRING, 3, L"開啟常用短語");
+    AppendMenuW(menu, MF_STRING, 4, L"開啟自訂詞庫");
+    AppendMenuW(menu, MF_STRING, 5, L"開啟選字歷史");
+    AppendMenuW(menu, MF_STRING, 6, L"開啟離線候選快取");
+    AppendMenuW(menu, MF_STRING, 7, L"開啟設定檔");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 6, L"結束程式");
+    AppendMenuW(menu, MF_STRING, 8, L"清除本機選字歷史");
+    AppendMenuW(menu, MF_STRING, 9, L"清除離線候選快取");
+    AppendMenuW(menu, MF_STRING, 10, L"清除所有本機資料…");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 11, L"結束程式");
     SetForegroundWindow(gMain);
     int choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, point.x, point.y, 0, gMain, nullptr);
     DestroyMenu(menu);
     if (choice == 1) ToggleInput();
     if (choice == 2) ToggleLanguageMode();
-    if (choice == 3) { EnsureDictionaryFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"custom_dictionary.tsv").c_str(), nullptr, SW_SHOWNORMAL); }
-    if (choice == 4) { EnsureSettingsFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"settings.ini").c_str(), nullptr, SW_SHOWNORMAL); }
-    if (choice == 5) { ClearHistoryFile(); gStatus = L"已清除本機選字歷史"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
-    if (choice == 6) PostMessage(gMain, WM_CLOSE, 0, 0);
+    if (choice == 3) { EnsureSnippetsFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"snippets.tsv").c_str(), nullptr, SW_SHOWNORMAL); }
+    if (choice == 4) { EnsureDictionaryFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"custom_dictionary.tsv").c_str(), nullptr, SW_SHOWNORMAL); }
+    if (choice == 5) ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"history.tsv").c_str(), nullptr, SW_SHOWNORMAL);
+    if (choice == 6) ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"candidate_cache.tsv").c_str(), nullptr, SW_SHOWNORMAL);
+    if (choice == 7) { EnsureSettingsFile(); ShellExecuteW(nullptr, L"open", SystemNotepadPath().c_str(), DataFilePath(L"settings.ini").c_str(), nullptr, SW_SHOWNORMAL); }
+    if (choice == 8) { ClearHistoryFile(); gStatus = L"已清除本機選字歷史"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
+    if (choice == 9) { ClearCandidateCache(); gStatus = L"已清除離線候選快取"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr); }
+    if (choice == 10 && MessageBoxW(gMain, L"會清除短語、詞庫、歷史與離線候選快取。此操作無法復原，是否繼續？", L"CantoCandidate", MB_YESNO | MB_ICONWARNING) == IDYES) {
+        const wchar_t* files[] = {L"snippets.tsv", L"custom_dictionary.tsv", L"history.tsv", L"candidate_cache.tsv"};
+        for (const wchar_t* file : files) { std::wstring path = DataFilePath(file); if (IsSafeDataPath(path)) DeleteFileW(path.c_str()); }
+        EnsureSnippetsFile(); EnsureDictionaryFile();
+        gStatus = L"已清除本機資料"; ResizeAndShowCandidate(); SetTimer(gMain, TIMER_STATUS, 1200, nullptr);
+    }
+    if (choice == 11) PostMessage(gMain, WM_CLOSE, 0, 0);
 }
 
 LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -813,6 +989,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     popupWindow.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&popupWindow);
     EnsureDictionaryFile();
+    EnsureSnippetsFile();
     LoadSettings();
     gMain = CreateWindowExW(0, mainClass, L"CantoCandidate", WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
     gCandidateWindow = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, candidateClass, L"", WS_POPUP, 0, 0, 0, 0, gMain, nullptr, instance, nullptr);
