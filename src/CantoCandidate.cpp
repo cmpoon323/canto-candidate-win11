@@ -83,14 +83,21 @@ ULONGLONG gLastCandidateStartTick = 0;
 ULONGLONG gLastCandidateDoneTick = 0;
 ULONGLONG gLastCandidateDurationMs = 0;
 std::wstring gLastWorkerDetail = L"尚未執行候選請求";
-bool gHmpaCompatibilityMode = false;
+bool gHmpaCompatibilityMode = false;  // Retained only for the optional manual safe panel.
+bool gHmpaDetected = false;
 HWND gSafePadWindow = nullptr;
 HWND gSafeInputControl = nullptr;
 HWND gSafeResultsControl = nullptr;
 HWND gSafeStatusControl = nullptr;
+bool gCandidateDragging = false;
+POINT gCandidateDragCursor{};
+POINT gCandidateDragWindow{};
 
 struct Settings {
     bool followCaret = true;
+    bool fixedCandidatePosition = true;
+    int candidateX = -1;
+    int candidateY = -1;
     bool preserveClipboard = true;
     bool singleShiftToggle = true;
     bool darkMode = true;
@@ -273,7 +280,7 @@ int ReadSettingInteger(const std::wstring& data, const std::wstring& key, int fa
 }
 
 void EnsureSettingsFile() {
-    const std::string starter = "; CantoCandidate settings (0=off, 1=on)\n; Restart CantoCandidate after changing this file.\nfollow_caret=1\npreserve_clipboard=1\nsingle_shift_toggle=1\ndark_mode=1\ncandidate_font_size=22\ncandidate_page_size=9\nsnippet_prefix=;\nlocal_fuzzy_suggestions=1\ncontext_ranking=1\n";
+    const std::string starter = "; CantoCandidate settings (0=off, 1=on)\n; Restart CantoCandidate after changing this file.\nfollow_caret=1\nfixed_candidate_position=1\ncandidate_x=-1\ncandidate_y=-1\npreserve_clipboard=1\nsingle_shift_toggle=1\ndark_mode=1\ncandidate_font_size=22\ncandidate_page_size=9\nsnippet_prefix=;\nlocal_fuzzy_suggestions=1\ncontext_ranking=1\n";
     WriteUtf8File(DataFilePath(L"settings.ini"), starter, CREATE_NEW);
 }
 
@@ -282,6 +289,9 @@ void LoadSettings() {
     std::wstring data = Utf8ToWide(ReadUtf8File(DataFilePath(L"settings.ini")));
     if (data.empty()) return;
     gSettings.followCaret = ReadSettingValue(data, L"follow_caret", true);
+    gSettings.fixedCandidatePosition = ReadSettingValue(data, L"fixed_candidate_position", true);
+    gSettings.candidateX = ReadSettingInteger(data, L"candidate_x", -1, -1, 32767);
+    gSettings.candidateY = ReadSettingInteger(data, L"candidate_y", -1, -1, 32767);
     gSettings.preserveClipboard = ReadSettingValue(data, L"preserve_clipboard", true);
     gSettings.singleShiftToggle = ReadSettingValue(data, L"single_shift_toggle", true);
     gSettings.darkMode = ReadSettingValue(data, L"dark_mode", true);
@@ -291,6 +301,42 @@ void LoadSettings() {
     if (prefix.size() == 1 && !iswspace(prefix[0]) && prefix[0] < 128) gSettings.snippetPrefix = prefix[0];
     gSettings.localFuzzySuggestions = ReadSettingValue(data, L"local_fuzzy_suggestions", true);
     gSettings.contextRanking = ReadSettingValue(data, L"context_ranking", true);
+}
+
+
+bool SaveCandidatePositionSettings(int x, int y) {
+    const std::wstring path = DataFilePath(L"settings.ini");
+    std::wstring data = Utf8ToWide(ReadUtf8File(path));
+    if (data.empty()) return false;
+    const std::vector<std::pair<std::wstring, std::wstring>> values = {
+        {L"fixed_candidate_position", L"1"},
+        {L"candidate_x", std::to_wstring(x)},
+        {L"candidate_y", std::to_wstring(y)}
+    };
+    std::wstringstream lines(data);
+    std::wstring line;
+    std::wstring output;
+    std::vector<bool> written(values.size(), false);
+    while (std::getline(lines, line)) {
+        const size_t equals = line.find(L'=');
+        bool replaced = false;
+        if (equals != std::wstring::npos && !line.empty() && line[0] != L';' && line[0] != L'#') {
+            const std::wstring key = line.substr(0, equals);
+            for (size_t index = 0; index < values.size(); ++index) {
+                if (key == values[index].first) {
+                    output += values[index].first + L"=" + values[index].second + L"\n";
+                    written[index] = true;
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+        if (!replaced) output += line + L"\n";
+    }
+    for (size_t index = 0; index < values.size(); ++index) {
+        if (!written[index]) output += values[index].first + L"=" + values[index].second + L"\n";
+    }
+    return WriteUtf8File(path, WideToUtf8(output));
 }
 
 struct HistoryEntry {
@@ -672,7 +718,7 @@ bool DownloadCandidates(const std::wstring& composition, CandidateResult& result
     std::string targetUtf8 = "/request?text=" + UrlEncodeAscii(composition) +
         "&itc=yue-hant-t-i0-und&num=45&cp=0&cs=1&ie=utf-8&oe=utf-8";
     std::wstring target = Utf8ToWide(targetUtf8);
-    HINTERNET session = WinHttpOpen(L"CantoCandidate/0.8.4", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET session = WinHttpOpen(L"CantoCandidate/0.8.8", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) { result.error = L"無法建立網絡連線"; return false; }
     WinHttpSetTimeouts(session, 1200, 1200, 1800, 1800);
     HINTERNET connection = WinHttpConnect(session, L"inputtools.google.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -863,16 +909,26 @@ void ResizeAndShowCandidate() {
     if (!gCandidateWindow) return;
     std::wstring display = CandidateDisplayText();
     if (display.empty()) { ShowWindow(gCandidateWindow, SW_HIDE); return; }
-    POINT point{};
-    if (!gSettings.followCaret || !TryGetCaretAnchor(point)) GetCursorPos(&point);
-    int width = 820;
-    int height = std::max(82, gSettings.candidateFontSize * 3 + 20);
-    int x = std::max(4L, point.x - 20L);
-    int y = point.y + 24;
+    const int width = 820;
+    const int height = std::max(82, gSettings.candidateFontSize * 3 + 20);
     RECT work{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    if (x + width > work.right) x = std::max(4L, work.right - width - 4);
-    if (y + height > work.bottom) y = point.y - height - 12;
+    int x = 0;
+    int y = 0;
+    if (gSettings.fixedCandidatePosition) {
+        // An unset saved position starts in the lower-right corner of the primary work area.
+        x = gSettings.candidateX >= 0 ? gSettings.candidateX : work.right - width - 18;
+        y = gSettings.candidateY >= 0 ? gSettings.candidateY : work.bottom - height - 18;
+        x = std::max(static_cast<int>(work.left + 4), std::min(x, static_cast<int>(work.right - width - 4)));
+        y = std::max(static_cast<int>(work.top + 4), std::min(y, static_cast<int>(work.bottom - height - 4)));
+    } else {
+        POINT point{};
+        if (!gSettings.followCaret || !TryGetCaretAnchor(point)) GetCursorPos(&point);
+        x = std::max(static_cast<int>(work.left + 4), static_cast<int>(point.x - 20));
+        y = static_cast<int>(point.y + 24);
+        if (x + width > work.right) x = std::max(static_cast<int>(work.left + 4), static_cast<int>(work.right - width - 4));
+        if (y + height > work.bottom) y = point.y - height - 12;
+    }
     SetWindowPos(gCandidateWindow, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(gCandidateWindow, nullptr, TRUE);
 }
@@ -907,6 +963,51 @@ void RestoreClipboardIfUnchanged() {
     ReleaseClipboardBackup();
 }
 
+HWND ForegroundPasteTarget() {
+    HWND foreground = GetForegroundWindow();
+    if (!foreground) return nullptr;
+    DWORD targetThread = GetWindowThreadProcessId(foreground, nullptr);
+    GUITHREADINFO info{};
+    info.cbSize = sizeof(info);
+    if (targetThread && GetGUIThreadInfo(targetThread, &info)) {
+        if (info.hwndFocus && IsWindow(info.hwndFocus)) return info.hwndFocus;
+        if (info.hwndActive && IsWindow(info.hwndActive)) return info.hwndActive;
+    }
+    return foreground;
+}
+
+std::wstring ForegroundPasteTargetClass(HWND target) {
+    wchar_t className[128]{};
+    if (!target || !GetClassNameW(target, className, static_cast<int>(std::size(className)))) return L"";
+    return className;
+}
+
+bool IsStandardPasteControl(HWND target) {
+    const std::wstring className = ForegroundPasteTargetClass(target);
+    return className == L"Edit" || className == L"RichEdit20A" || className == L"RichEdit20W" ||
+           className == L"RICHEDIT50W" || className == L"RichEditD2DPT" || className == L"Scintilla";
+}
+
+bool DispatchPasteToForegroundControl(HWND target) {
+    if (!target || !IsWindow(target)) return false;
+    DWORD_PTR ignored = 0;
+    const bool delivered = SendMessageTimeoutW(target, WM_PASTE, 0, 0,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK, 300, &ignored) != 0;
+    AppendDiagnosticLog(L"WM_PASTE target=" + ForegroundPasteTargetClass(target) +
+                        L" standard=" + (IsStandardPasteControl(target) ? L"1" : L"0") +
+                        L" delivered=" + (delivered ? L"1" : L"0"));
+    return delivered;
+}
+
+bool InjectCtrlVFallback() {
+    INPUT input[4]{};
+    input[0].type = INPUT_KEYBOARD; input[0].ki.wVk = VK_CONTROL;
+    input[1].type = INPUT_KEYBOARD; input[1].ki.wVk = 'V';
+    input[2].type = INPUT_KEYBOARD; input[2].ki.wVk = 'V'; input[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    input[3].type = INPUT_KEYBOARD; input[3].ki.wVk = VK_CONTROL; input[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    return SendInput(4, input, sizeof(INPUT)) == 4;
+}
+
 void PasteText(const std::wstring& text) {
     if (text.empty()) return;
     RestoreClipboardIfUnchanged();
@@ -915,26 +1016,50 @@ void PasteText(const std::wstring& text) {
     EmptyClipboard();
     SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
     HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    bool clipboardReady = false;
     if (memory) {
         void* destination = GlobalLock(memory);
         if (destination) {
             memcpy(destination, text.c_str(), bytes);
             GlobalUnlock(memory);
-            if (!SetClipboardData(CF_UNICODETEXT, memory)) GlobalFree(memory);
+            clipboardReady = SetClipboardData(CF_UNICODETEXT, memory) != nullptr;
+            if (!clipboardReady) GlobalFree(memory);
         } else {
             GlobalFree(memory);
         }
     }
     CloseClipboard();
-    INPUT input[4]{};
-    input[0].type = INPUT_KEYBOARD; input[0].ki.wVk = VK_CONTROL;
-    input[1].type = INPUT_KEYBOARD; input[1].ki.wVk = 'V';
-    input[2].type = INPUT_KEYBOARD; input[2].ki.wVk = 'V'; input[2].ki.dwFlags = KEYEVENTF_KEYUP;
-    input[3].type = INPUT_KEYBOARD; input[3].ki.wVk = VK_CONTROL; input[3].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(4, input, sizeof(INPUT));
-    if (gClipboardBackup) {
-        gClipboardSequenceAfterPaste = GetClipboardSequenceNumber();
-        SetTimer(gMain, TIMER_CLIPBOARD_RESTORE, 150, nullptr);
+    if (!clipboardReady) { ReleaseClipboardBackup(); return; }
+    gClipboardSequenceAfterPaste = GetClipboardSequenceNumber();
+    HWND target = ForegroundPasteTarget();
+    const bool standardControl = IsStandardPasteControl(target);
+    bool delivered = DispatchPasteToForegroundControl(target);
+    bool injectedFallback = false;
+    if (!delivered || !standardControl) {
+        // Many custom controls consume Ctrl+V but do not implement WM_PASTE.
+        // Use the legacy path only when HMPA was not detected; never bypass a
+        // managed endpoint mitigation with injected keyboard input.
+        if (!gHmpaDetected) {
+            delivered = InjectCtrlVFallback();
+            injectedFallback = delivered;
+            AppendDiagnosticLog(L"Ctrl+V fallback used delivered=" + std::wstring(delivered ? L"1" : L"0"));
+        } else {
+            delivered = false;
+            AppendDiagnosticLog(L"Ctrl+V fallback blocked because hmpalert.dll is loaded");
+        }
+    }
+    if (!delivered) {
+        gStatus = L"無法貼到目前程式；請確認文字欄焦點及程式權限";
+        QueueCandidateRefresh();
+    }
+    if (injectedFallback && gClipboardBackup) {
+        // SendInput only queues Ctrl+V. Word/Chrome read the clipboard later,
+        // so restoring it here would erase the candidate before they paste it.
+        SetTimer(gMain, TIMER_CLIPBOARD_RESTORE, 180, nullptr);
+        AppendDiagnosticLog(L"clipboard restore deferred after injected Ctrl+V");
+    } else {
+        // WM_PASTE is synchronous, or no delayed clipboard restoration is needed.
+        RestoreClipboardIfUnchanged();
     }
 }
 
@@ -1004,6 +1129,38 @@ void ToggleInput() {
 }
 
 LRESULT CALLBACK CandidateWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_LBUTTONDOWN) {
+        GetCursorPos(&gCandidateDragCursor);
+        RECT rect{};
+        GetWindowRect(hwnd, &rect);
+        gCandidateDragWindow = {rect.left, rect.top};
+        gCandidateDragging = true;
+        SetCapture(hwnd);
+        return 0;
+    }
+    if (message == WM_MOUSEMOVE && gCandidateDragging && GetCapture() == hwnd) {
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        const int x = gCandidateDragWindow.x + cursor.x - gCandidateDragCursor.x;
+        const int y = gCandidateDragWindow.y + cursor.y - gCandidateDragCursor.y;
+        SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        return 0;
+    }
+    if ((message == WM_LBUTTONUP || message == WM_CAPTURECHANGED) && gCandidateDragging) {
+        const bool releasedByMouse = message == WM_LBUTTONUP;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        gCandidateDragging = false;
+        if (releasedByMouse) {
+            RECT rect{};
+            GetWindowRect(hwnd, &rect);
+            gSettings.fixedCandidatePosition = true;
+            gSettings.candidateX = rect.left;
+            gSettings.candidateY = rect.top;
+            const bool saved = SaveCandidatePositionSettings(rect.left, rect.top);
+            AppendDiagnosticLog(std::wstring(L"candidate window moved; position save=") + (saved ? L"1" : L"0"));
+        }
+        return 0;
+    }
     if (message == WM_PAINT) {
         PAINTSTRUCT paint{};
         HDC hdc = BeginPaint(hwnd, &paint);
@@ -1227,6 +1384,7 @@ std::wstring RepairPanelText() {
     text += L"輸入：" + std::wstring(gEnabled ? L"已開啟" : L"已關閉") + L"　模式：" + (gEnglishMode ? L"英文" : L"粵語拼音") + L"\r\n";
     text += L"鍵盤掛鈎：" + std::wstring(gHook ? L"已安裝" : L"未安裝") + L"　最近按鍵：" + (gLastHookTick ? std::to_wstring(hookAge) + L" ms 前" : L"尚未收到") + L"\r\n";
     text += L"候選工作：" + std::wstring(gCandidateWorkerActive ? L"處理中" : L"閒置") + L"　工作時間：" + (gCandidateWorkerActive ? std::to_wstring(candidateAge) + L" ms" : std::to_wstring(gLastCandidateDurationMs) + L" ms") + L"\r\n";
+    text += L"端點防護：" + std::wstring(gHmpaDetected ? L"已偵測 Sophos／HitmanPro.Alert（背景兼容測試）" : L"未偵測 hmpalert.dll") + L"\r\n";
     text += L"目前狀態：" + gLastWorkerDetail + L"\r\n";
     text += L"診斷記錄：" + DiagnosticsPath() + L"\r\n\r\n";
     text += L"「立即修復」會重新建立鍵盤掛鈎、快捷鍵與系統匣；不會改動你的詞庫或歷史。";
@@ -1608,20 +1766,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadSettings();
     gMain = CreateWindowExW(0, mainClass, L"CantoCandidate", WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
     gCandidateWindow = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, candidateClass, L"", WS_POPUP, 0, 0, 0, 0, gMain, nullptr, instance, nullptr);
-    gHmpaCompatibilityMode = GetModuleHandleW(L"hmpalert.dll") != nullptr;
-    if (gHmpaCompatibilityMode) {
-        gStatus = L"已偵測 Sophos／HitmanPro.Alert；使用安全相容輸入面板";
-        gLastWorkerDetail = L"安全相容模式：未安裝全域鍵盤掛鈎";
-        AppendDiagnosticLog(L"hmpalert.dll detected; global keyboard hook disabled and safe compatibility mode enabled");
-    } else {
-        if (!RegisterHotKey(gMain, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G')) {
-            AppendDiagnosticLog(L"startup hotkey registration failed error=" + std::to_wstring(GetLastError()));
-        }
-        gHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, instance, 0);
-        if (!gHook) AppendDiagnosticLog(L"startup keyboard hook failed error=" + std::to_wstring(GetLastError()));
+    gHmpaDetected = GetModuleHandleW(L"hmpalert.dll") != nullptr;
+    gHmpaCompatibilityMode = false;
+    if (gHmpaDetected) {
+        gLastWorkerDetail = L"偵測到 Sophos／HitmanPro.Alert；使用背景候選的直接 WM_PASTE 提交";
+        AppendDiagnosticLog(L"hmpalert.dll detected; background mode uses direct WM_PASTE instead of SendInput");
     }
+    if (!RegisterHotKey(gMain, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G')) {
+        AppendDiagnosticLog(L"startup hotkey registration failed error=" + std::to_wstring(GetLastError()));
+    }
+    gHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, instance, 0);
+    if (!gHook) AppendDiagnosticLog(L"startup keyboard hook failed error=" + std::to_wstring(GetLastError()));
     if (!AddTrayIcon()) AppendDiagnosticLog(L"startup tray creation failed error=" + std::to_wstring(GetLastError()));
-    if (gHmpaCompatibilityMode) PostMessageW(gMain, WM_OPEN_SAFE_PAD, 0, 0);
     MSG message{};
     int getMessageResult = 0;
     while ((getMessageResult = GetMessageW(&message, nullptr, 0, 0)) > 0) {

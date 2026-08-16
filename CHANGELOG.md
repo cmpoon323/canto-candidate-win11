@@ -2,6 +2,12 @@
 
 本專案由可攜式粵語候選字輔助工具逐步演進。v0.5 是首個可重現建置並正式公開發佈的安全修正版；v0.1 至 v0.4 的原始中間二進位檔沒有保留，因此以下紀錄描述功能演進，而不把事後重建的檔案誤標為歷史原始產物。
 
+## v0.8.8 Online — Word／Chrome 上屏時序修正
+
+修正非標準文字控制項的 Ctrl+V 後備在目標 App 尚未讀取候選字前便立即還原剪貼簿的時序錯誤。現在 Word、Chrome 等控制項走注入式 Ctrl+V 後備時，會保留候選字 180 ms，再以剪貼簿序號保護方式還原；標準 Edit／RichEdit 控制項維持直接 `WM_PASTE`。此修正已在 Windows 11 的 Microsoft Word 與 Chrome 實機驗證成功。
+
+同時加入候選窗預設右下角、滑鼠左鍵拖曳及 `settings.ini` 位置保存，並保留前景控制項診斷。若偵測到 Sophos／HitmanPro.Alert，程式仍不會使用注入式 Ctrl+V 後備，以避免重現 `hmpalert.dll` 相容性崩潰。
+
 ## v0.8.4 Online — Sophos／HitmanPro.Alert 安全相容模式
 
 根據實機 Windows Application Error Event ID 1000：`hmpalert.dll` 的存取違規，新增端點防護安全相容模式。啟動時若偵測到 `hmpalert.dll` 已載入，程式不安裝 `WH_KEYBOARD_LL` 全域鍵盤掛鈎、不攔截背景按鍵、不使用 `SendInput` 自動貼字，並自動開啟前景「安全相容輸入」面板。使用者可輸入粵拼、搜尋 Google 候選、複製選取結果，再手動於目標程式按 `Ctrl + V`。此模式已在受 Sophos／HitmanPro.Alert 管理的 Windows 11 裝置完成穩定性實機驗證。未偵測到該模組的電腦，則維持背景候選與 NumPad 操作。
